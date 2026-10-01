@@ -4,10 +4,10 @@ Author      : yhy
 Date        : 30/09/2026
 Licence     : The Unlicense; see LICENSE for details.
 Description : The linker script for the user-mode init program.
-              QEMU loads the init binary at 0x81030000 (see qemu.sh), and
-              the kernel's RME_RV64V_INIT_ENTRY points there. The init
-              thread runs it in U-mode; until the Sv39 MMU is enabled the
-              address is a plain VA = PA mapping in RAM.
+              QEMU loads the raw binary at the physical 0x81030000 (see
+              qemu.sh), but the program is linked and runs at the user virtual
+              address 0x20000000 (same as X64); the kernel maps it and its
+              stack (VA 0x201F0000..0x20200000) onto the physical pages.
 ******************************************************************************/
 
 OUTPUT_FORMAT("elf64-littleriscv", "elf64-littleriscv", "elf64-littleriscv")
@@ -16,12 +16,11 @@ ENTRY(_start)
 
 SECTIONS
 {
-  /* QEMU virt RAM; clear of the kernel (0x80200000) and kernel objects
-   * (0x81000000..0x81020000, incl. the init thread stack at 0x81020000). */
-  . = 0x81030000;
+  /* User virtual address of the init program (matches X64's 0x20000000) */
+  . = 0x20000000;
 
   /* The entry section must come first so that the image starts exactly at
-   * 0x81030000, where the kernel's RME_RV64V_INIT_ENTRY srets to. */
+   * 0x20000000, where the kernel's RME_RV64V_INIT_ENTRY srets to. */
   .text : {
     *(.text._start)
     *(.text .text.* .gnu.linkonce.t.*)

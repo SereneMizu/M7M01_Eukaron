@@ -116,15 +116,14 @@ typedef rme_s64_t rme_ret_t;
 #define RME_TIMESTAMP                           (RME_RV64V_Timestamp)
 /* Cpt size limit - not restricted */
 #define RME_CPT_ENTRY_MAX                       (0U)
-/* Forcing VA=PA in user memory segments */
-#define RME_PGT_PHYS_ENABLE                     (1U)
-/* Normal page directory size calculation macro */
-#define RME_PGT_SIZE_PTR(NMORD)                 (RME_POW2(NMORD)*RME_WORD_BYTE)
-#define RME_PGT_SIZE_PERM(NMORD)                RME_ROUND_UP(RME_POW2(NMORD),RME_WORD_ORDER-3U)
-#define RME_PGT_SIZE_REG(NMORD)                 (RME_PGT_SIZE_PTR(NMORD)+RME_PGT_SIZE_PERM(NMORD))
-#define RME_PGT_SIZE_NOM(NMORD)                 (sizeof(struct __RME_RV64V_Pgt_Meta)+RME_PGT_SIZE_REG(NMORD))
+/* The kernel runs in the Sv39 high half and user processes in the low half,
+ * so mappings are no longer forced to VA=PA (virtual mapping is enabled) */
+#define RME_PGT_PHYS_ENABLE                     (0U)
+/* Normal page directory size calculation macro - the object memory IS the
+ * hardware page table */
+#define RME_PGT_SIZE_NOM(NMORD)                 (RME_POW2(NMORD)*RME_WORD_BYTE)
 /* Top-level page directory size calculation macro */
-#define RME_PGT_SIZE_TOP(NMORD)                 (sizeof(struct __RME_RV64V_PMP_Data)+RME_PGT_SIZE_NOM(NMORD))
+#define RME_PGT_SIZE_TOP(NMORD)                 RME_PGT_SIZE_NOM(NMORD)
 /* The kernel object allocation table address - original */
 #define RME_KOT_VA_BASE                         RME_RV64V_Kot
 /* Invocation stack maximum depth - not restricted */
@@ -146,12 +145,6 @@ typedef rme_s64_t rme_ret_t;
 /* The CPU and application specific macros are here */
 #include "rme_platform_rv64v_conf.h"
 
-/* Vector/signal flag */
-#define RME_RVM_VCT_SIG_ALL                     (0U)
-#define RME_RVM_VCT_SIG_SELF                    (1U)
-#define RME_RVM_VCT_SIG_INIT                    (2U)
-#define RME_RVM_VCT_SIG_NONE                    (3U)
-#define RME_RVM_FLAG_SET(B, S, N)               ((volatile struct __RME_RVM_Flag*)((B)+((S)>>1)*(N)))
 /* End System Macro **********************************************************/
 
 /* RV64V Macro ***************************************************************/
@@ -255,8 +248,16 @@ while(0)
 /* Initialization ************************************************************/
 /* The capability table of the init process */
 #define RME_BOOT_INIT_CPT                       (0U)
-/* The top-level page table of the init process - always 4GB full range split into 8 pages */
+/* The top-level (Sv39 root) page table of the init process. One entry covers
+ * 1GB, 512 entries cover the whole 512GB low canonical address space. */
 #define RME_BOOT_INIT_PGT                       (1U)
+/* The second-level page table of the init process, attached to top entry 2 to
+ * cover [0x80000000, 0xC0000000) with 512 x 2MB large pages. */
+#define RME_BOOT_INIT_PGT_L1                    (7U)
+/* The third-level (4KB granularity) page table, attached to L1 entry 8 to
+ * cover [0x81000000, 0x81200000). Kernel and user pages live side by side in
+ * this 2MB window, so they cannot share a single large page. */
+#define RME_BOOT_INIT_PGT_L2                    (8U)
 /* The init process */
 #define RME_BOOT_INIT_PRC                       (2U)
 /* The init thread */
@@ -272,68 +273,65 @@ while(0)
 #define RME_RV64V_CPT                           ((struct RME_Cap_Cpt*)(RME_KOM_VA_BASE))
 
 /* Page Table ****************************************************************/
-/* For RV64V:
- * The layout of the page entry is:
- * [31:5] Paddr - The physical address to map this page to, or the physical
- *                address of the next layer of page table. This address is
- *                always aligned to 32 bytes.
- * [4:2] Reserved - Because subregions must share attributes, we have the permission
- *                  flags in the page table headers ("Page_Flags" field). These flags
- *                  are completely identical to RME standard page flags.
- * [1] Terminal - Is this page a terminal page, or points to another page table?
- * [0] Present - Is this entry present?
- *
- * The layout of a directory entry is:
- * [31:2] Paddr - The in-kernel physical address of the lower page directory.
- * [1] Terminal - Is this page a terminal page, or points to another page table?
- * [0] Present - Is this entry present?
- *
- * The rest of the bits are in the Flag[] array following these layouts. */
+/* Kernel VA mapping base address. The kernel lives in the Sv39 high canonical
+ * half while physical memory (kernel image, KOM, stacks) stays low, so the
+ * kernel is reached at PA+VA_BASE and user processes map the low half. This is
+ * the single VA<->PA translation point for the whole port. */
+#define RME_RV64V_VA_BASE                         (0xFFFFFFC000000000ULL)
+/* Convert PA->VA and VA->PA */
+#define RME_RV64V_PA2VA(PA)                       (((rme_ptr_t)(PA))+RME_RV64V_VA_BASE)
+#define RME_RV64V_VA2PA(VA)                       (((rme_ptr_t)(VA))-RME_RV64V_VA_BASE)
 
-/* PMP register number */
-#define RME_RV64V_PMPCFG_NUM                    ((RME_RV64V_REGION_NUM+3U)>>2)
+/* Sv39 page table entry layout (64-bit):
+ * [63]    PBMT/N  - ignored in base Sv39
+ * [53:10] PPN     - physical page number, PA[55:12]
+ * [9:8]   RSW     - reserved for software, kept zero
+ * [7]     D       - dirty (hardware maintained)
+ * [6]     A       - accessed (hardware maintained)
+ * [5]     G       - global
+ * [4]     U       - user accessible
+ * [3]     X       - execute
+ * [2]     W       - write (W=1 requires R=1)
+ * [1]     R       - read
+ * [0]     V       - valid
+ */
+#define RME_RV64V_MMU_V                           (((rme_ptr_t)1)<<0)
+#define RME_RV64V_MMU_R                           (((rme_ptr_t)1)<<1)
+#define RME_RV64V_MMU_W                           (((rme_ptr_t)1)<<2)
+#define RME_RV64V_MMU_X                           (((rme_ptr_t)1)<<3)
+#define RME_RV64V_MMU_U                           (((rme_ptr_t)1)<<4)
+#define RME_RV64V_MMU_G                           (((rme_ptr_t)1)<<5)
+#define RME_RV64V_MMU_A                           (((rme_ptr_t)1)<<6)
+#define RME_RV64V_MMU_D                           (((rme_ptr_t)1)<<7)
+/* A valid entry is a leaf when at least one of R/W/X is set; otherwise it is
+ * a non-leaf entry pointing at the next level table. */
+#define RME_RV64V_MMU_LEAF                        (RME_RV64V_MMU_R|RME_RV64V_MMU_W|RME_RV64V_MMU_X)
+/* The PPN field occupies PTE[53:10] */
+#define RME_RV64V_MMU_PPN_MASK                    (0x003FFFFFFFFFFC00ULL)
+/* Physical address -> PTE PPN field (PA[55:12] placed at bit 10) */
+#define RME_RV64V_MMU_PPN(X)                      ((((rme_ptr_t)(X))>>12)<<10)
+/* PTE -> physical address (PPN<<12) */
+#define RME_RV64V_MMU_ADDR(X)                     ((((rme_ptr_t)(X))&RME_RV64V_MMU_PPN_MASK)>>10<<12)
 
-/* Get the actual table positions */
-#define RME_RV64V_PGT_META                      (sizeof(struct __RME_RV64V_Pgt_Meta)/RME_WORD_BYTE)
-#define RME_RV64V_PMP_DATA                      (sizeof(struct __RME_RV64V_PMP_Data)/RME_WORD_BYTE)
-#define RME_RV64V_PGT_TBL_NOM(X)                (((rme_ptr_t*)(X))+RME_RV64V_PGT_META)
-#define RME_RV64V_PGT_TBL_TOP(X)                (((rme_ptr_t*)(X))+RME_RV64V_PGT_META+RME_RV64V_PMP_DATA)
+/* Get the actual table positions - the object memory IS the table */
+#define RME_RV64V_PGT_TBL_NOM(X)                  (X)
+#define RME_RV64V_PGT_TBL_TOP(X)                  (X)
 
-/* Page entry bit definitions */
-#define RME_RV64V_PGT_PRESENT                   RME_POW2(0U)
-#define RME_RV64V_PGT_TERMINAL                  RME_POW2(1U)
-/* The address mask for the actual page address */
-#define RME_RV64V_PGT_PTE_ADDR(X)               ((X)&0xFFFFFFFCU)
-/* The address mask for the next level page table address */
-#define RME_RV64V_PGT_PGD_ADDR(X)               ((X)&0xFFFFFFFCU)
-
-/* Merge flag permissions */
-#define RME_RV64V_PGT_MERGE(X)                  ((X)&(RME_PGT_READ|RME_PGT_WRITE|RME_PGT_EXECUTE))
-/* Decide entry mode */
-#define RME_RV64V_PGT_MODE(X) \
-do \
-{ \
-    Size_Div4=(X).End_Div4-(X).Start_Div4; \
-    if(RME_IS_POW2(Size_Div4)) \
-    { \
-        (X).Order_Div4=RME_MSB_GET(Size_Div4); \
-    } \
-    else \
-    { \
-        (X).Order_Div4=0U; \
-    } \
-} \
-while(0)
-
-/* Write info to PMP */
-#define RME_RV64V_PMP_PERM(X)                   ((X)&0x07U)
-#define RME_RV64V_PMP_READ                      RME_POW2(0U)
-#define RME_RV64V_PMP_WRITE                     RME_POW2(1U)
-#define RME_RV64V_PMP_EXECUTE                   RME_POW2(2U)
-#define RME_RV64V_PMP_MODE(X)                   ((X)&RME_FIELD(3U,3U))
-#define RME_RV64V_PMP_OFF                       RME_FIELD(3U,3U)
-#define RME_RV64V_PMP_TOR                       RME_FIELD(1U,3U)
-#define RME_RV64V_PMP_NAPOT                     RME_FIELD(3U,3U)
+/* Convert the RME page flags into a Sv39 leaf PTE flag field. The RME R/W/X
+ * bits happen to line up with the Sv39 bits, but W must imply R. CACHE/BUFFER/
+ * STATIC have no hardware bit in base Sv39, so they are ignored. */
+#define RME_RV64V_PGFLG_RME2NAT(FLAGS) \
+    (RME_RV64V_MMU_V| \
+     ((((FLAGS)&RME_PGT_READ)!=0U)?RME_RV64V_MMU_R:0U)| \
+     ((((FLAGS)&RME_PGT_WRITE)!=0U)?(RME_RV64V_MMU_W|RME_RV64V_MMU_R):0U)| \
+     ((((FLAGS)&RME_PGT_EXECUTE)!=0U)?RME_RV64V_MMU_X:0U))
+/* Convert a Sv39 PTE back into RME page flags. Every page is reported as
+ * cacheable+bufferable because base Sv39 has no per-page cache attributes. */
+#define RME_RV64V_PGFLG_NAT2RME(FLAGS) \
+    (RME_PGT_CACHE|RME_PGT_BUFFER| \
+     ((((FLAGS)&RME_RV64V_MMU_R)!=0U)?RME_PGT_READ:0U)| \
+     ((((FLAGS)&RME_RV64V_MMU_W)!=0U)?RME_PGT_WRITE:0U)| \
+     ((((FLAGS)&RME_RV64V_MMU_X)!=0U)?RME_PGT_EXECUTE:0U))
 
 /* Platform-specific kernel function macros **********************************/
 /* Page table entry mode which property to get */
@@ -451,16 +449,6 @@ while(0)
 #define __HDR_DEF__
 #undef __HDR_DEF__
 /*****************************************************************************/
-/* Handler *******************************************************************/
-/* Interrupt flag structure */
-struct __RME_RVM_Flag
-{
-    rme_ptr_t Lock;
-    rme_ptr_t Fast;
-    rme_ptr_t Group;
-    rme_ptr_t Flag[1024];
-};
-
 /* Register Manipulation *****************************************************/
 /* The register set struct */
 struct RME_Reg_Struct
@@ -596,43 +584,12 @@ struct RME_Iret_Struct
 };
 
 /* Page Table ****************************************************************/
-/* Raw PMP cache - naked for user-level configurations only */
-struct __RME_RV64V_Raw_Pgt
+/* The kernel half of a top-level table. Every top-level page table must carry
+ * these entries so that a change of satp keeps the kernel mapped. */
+struct __RME_RV64V_Kern_Pgt
 {
-    rme_ptr_t Cfg[RME_RV64V_PMPCFG_NUM];
-    rme_ptr_t Addr[RME_RV64V_REGION_NUM];
+    rme_ptr_t Root[RME_POW2(RME_PGT_NUM_512)];
 };
-
-/* Page table metadata structure */
-#if(RME_PGT_RAW_ENABLE==0U)
-struct __RME_RV64V_Pgt_Meta
-{
-    /* The start mapping address of this page table */
-    rme_ptr_t Base;
-    /* The size/num order of this level */
-    rme_ptr_t Order;
-};
-
-struct __RME_RV64V_PMP_Data
-{
-    /* Bitmap showing whether these are static or not */
-    rme_ptr_t Static;
-    /* The MPU data itself */
-    struct __RME_RV64V_Raw_Pgt Raw;
-};
-
-/* Decode struct for ease of processing - all address divided by 4 */
-struct __RME_RV64V_PMP_Range
-{
-    /* Mapping flags */
-    rme_ptr_t Flag;
-    /* Start/end address - [33:2] instead of [31:0]; PMP is 34-bit PAE */
-    rme_ptr_t Start_Div4;
-    rme_ptr_t End_Div4;
-    /* If size/4 is a power of 2, what power? */
-    rme_ptr_t Order_Div4;
-};
-#endif
 /*****************************************************************************/
 /* __RME_PLATFORM_RV64V_STRUCT__ */
 #endif
@@ -662,79 +619,10 @@ struct __RME_RV64V_PMP_Range
 /* End Private Variable ******************************************************/
 
 /* Private Function **********************************************************/
-/* Generator *****************************************************************/
-#if(RME_RVM_GEN_ENABLE!=0U)
-RME_EXTERN rme_ptr_t RME_Boot_Vct_Handler(struct RME_Reg_Struct* Reg,
-                                          rme_ptr_t Vct_Num);
-RME_EXTERN rme_ptr_t RME_Boot_Vct_Init(struct RME_Cap_Cpt* Cpt,
-                                       rme_ptr_t Cap_Front,
-                                       rme_ptr_t Kom_Front);
-RME_EXTERN void RME_Boot_Pre_Init(void);
-RME_EXTERN void RME_Boot_Post_Init(void);
-RME_EXTERN void RME_Reboot_Failsafe(void);
-RME_EXTERN rme_ret_t RME_Hook_Kfn_Handler(rme_ptr_t Func_ID,
-                                          rme_ptr_t Sub_ID,
-                                          rme_ptr_t Param1,
-                                          rme_ptr_t Param2);
-#endif
-/* PMP operations ************************************************************/
-RME_EXTERN void ___RME_RV64V_PMP_Set1(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set2(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set3(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set4(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set5(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set6(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set7(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set8(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set9(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set10(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set11(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set12(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set13(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set14(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set15(struct __RME_RV64V_Raw_Pgt* Raw);
-RME_EXTERN void ___RME_RV64V_PMP_Set16(struct __RME_RV64V_Raw_Pgt* Raw);
 /* Handler *******************************************************************/
 /* Fault handler */
 static void __RME_RV64V_Exc_Handler(struct RME_Reg_Struct* Reg,
                                     rme_ptr_t Mcause);
-/* Vector flags **************************************************************/
-static void __RME_RV64V_Flag_Fast(rme_ptr_t Base,
-                                  rme_ptr_t Size,
-                                  rme_ptr_t Flag);
-static void __RME_RV64V_Flag_Slow(rme_ptr_t Base,
-                                  rme_ptr_t Size,
-                                  rme_ptr_t Pos);
-/* Page table ****************************************************************/
-#if(RME_PGT_RAW_ENABLE==0U)
-static rme_ptr_t __RME_RV64V_Rand(void);
-static rme_ptr_t ___RME_RV64V_PMP_Decode(struct __RME_RV64V_PMP_Data* Top_Data,
-                                         struct __RME_RV64V_PMP_Range* Range);
-static void ___RME_RV64V_PMP_Range_Ins(struct __RME_RV64V_PMP_Range* Range,
-                                       rme_ptr_t Number,
-                                       rme_ptr_t Pos);
-static void ___RME_RV64V_PMP_Range_Del(struct __RME_RV64V_PMP_Range* Range,
-                                       rme_ptr_t Number,
-                                       rme_ptr_t Pos);
-static rme_ptr_t ___RME_RV64V_PMP_Range_Entry(struct __RME_RV64V_PMP_Range* Range,
-                                              rme_ptr_t Number);
-static rme_ptr_t ___RME_RV64V_PMP_Range_Kick(struct __RME_RV64V_PMP_Range* Range,
-                                             rme_ptr_t Number,
-                                             rme_ptr_t Add);
-static rme_ret_t ___RME_RV64V_PMP_Add(struct __RME_RV64V_PMP_Range* Range,
-                                      rme_ptr_t Number,
-                                      rme_ptr_t Paddr,
-                                      rme_ptr_t Size_Order,
-                                      rme_ptr_t Flag);
-static void ___RME_RV64V_PMP_Encode(struct __RME_RV64V_PMP_Data* Top_Data,
-                                    struct __RME_RV64V_PMP_Range* Range,
-                                    rme_ptr_t Number);
-
-static rme_ret_t ___RME_RV64V_PMP_Update(struct __RME_RV64V_Pgt_Meta* Top_Meta,
-                                         rme_ptr_t Paddr,
-                                         rme_ptr_t Size_Order,
-                                         rme_ptr_t Flag);
-#endif
 /* Kernel function ***********************************************************/
 #if(RME_PGT_RAW_ENABLE==0U)
 static rme_ret_t __RME_RV64V_Pgt_Entry_Mod(struct RME_Cap_Cpt* Cpt,
@@ -747,9 +635,6 @@ static rme_ret_t __RME_RV64V_Int_Local_Mod(rme_ptr_t Int_Num,
                                            rme_ptr_t Param);
 static rme_ret_t __RME_RV64V_Int_Local_Trig(rme_ptr_t CPUID,
                                             rme_ptr_t Int_Num);
-static rme_ret_t __RME_RV64V_Evt_Local_Trig(struct RME_Reg_Struct* Reg,
-                                            rme_ptr_t CPUID,
-                                            rme_ptr_t Evt_Num);
 static rme_ret_t __RME_RV64V_Cache_Maint(rme_ptr_t Cache_ID,
                                          rme_ptr_t Operation,
                                          rme_ptr_t Param);
@@ -797,6 +682,8 @@ __RME_EXTERN__ rme_ptr_t RME_RV64V_Timestamp;
 __RME_EXTERN__ struct RME_CPU_Local RME_RV64V_Local;
 /* RV64V use simple kernel object table */
 __RME_EXTERN__ rme_ptr_t RME_RV64V_Kot[RME_KOT_WORD_NUM];
+/* The kernel mapping template, copied into every top-level page table */
+__RME_EXTERN__ struct __RME_RV64V_Kern_Pgt RME_RV64V_Kpgt;
 /*****************************************************************************/
 
 /* End Public Variable *******************************************************/
@@ -815,6 +702,9 @@ RME_EXTERN rme_ptr_t ___RME_RV64V_CYCLE_Get(void);
 RME_EXTERN rme_ptr_t ___RME_RV64V_MISA_Get(void);
 RME_EXTERN rme_ptr_t ___RME_RV64V_SSTATUS_Get(void);
 RME_EXTERN void ___RME_RV64V_SSTATUS_Set(rme_ptr_t Value);
+/* MMU (satp) manipulations */
+RME_EXTERN void ___RME_RV64V_SATP_Set(rme_ptr_t Value);
+RME_EXTERN void ___RME_RV64V_TLB_Flush(void);
 /* OpenSBI (SBI) service helpers */
 RME_EXTERN rme_ptr_t ___RME_RV64V_Sbi_Call(rme_ptr_t A7,
                                            rme_ptr_t A0,

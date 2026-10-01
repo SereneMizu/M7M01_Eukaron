@@ -32,9 +32,9 @@ _start:
     BNE                 a1,a2,1b
 2:
 
-    /* Copy .data from load to run address would go here, but the QEMU
-     * loader places the image directly at its link address, so there is
-     * no LMA/VMA split - the copy is unnecessary. */
+    /* No .data relocation is needed: the kernel maps the program's virtual
+     * window straight onto the physical pages the loader filled, so the
+     * linked (virtual) addresses and the loaded (physical) bytes line up. */
 
     /* Call the C main function */
     CALL                main

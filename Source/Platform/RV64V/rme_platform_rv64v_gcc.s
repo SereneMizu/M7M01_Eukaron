@@ -84,9 +84,6 @@ F31    $ft11      temporary (caller-save)
     /* Locations provided by the linker */
     .extern             __RME_Stack
     .extern             __RME_Global
-    .extern             __RME_Data_Load
-    .extern             __RME_Data_Start
-    .extern             __RME_Data_End
     .extern             __RME_Zero_Start
     .extern             __RME_Zero_End
     /* Nonstandard low-level preinit that some platforms require */
@@ -116,6 +113,9 @@ F31    $ft11      temporary (caller-save)
     .global             ___RME_RV64V_MISA_Get
     .global             ___RME_RV64V_SSTATUS_Get
     .global             ___RME_RV64V_SSTATUS_Set
+    /* MMU (satp) manipulations */
+    .global             ___RME_RV64V_SATP_Set
+    .global             ___RME_RV64V_TLB_Flush
     /* Handler for everything */
     .global             __RME_RV64V_Handler
     /* Coprocessor save/load */
@@ -125,23 +125,6 @@ F31    $ft11      temporary (caller-save)
     .global             ___RME_RV64V_Thd_Cop_Save_RVD
     .global             ___RME_RV64V_Thd_Cop_Load_RVF
     .global             ___RME_RV64V_Thd_Cop_Load_RVD
-    /* The MPU setup routine */
-    .global             ___RME_RV64V_PMP_Set1
-    .global             ___RME_RV64V_PMP_Set2
-    .global             ___RME_RV64V_PMP_Set3
-    .global             ___RME_RV64V_PMP_Set4
-    .global             ___RME_RV64V_PMP_Set5
-    .global             ___RME_RV64V_PMP_Set6
-    .global             ___RME_RV64V_PMP_Set7
-    .global             ___RME_RV64V_PMP_Set8
-    .global             ___RME_RV64V_PMP_Set9
-    .global             ___RME_RV64V_PMP_Set10
-    .global             ___RME_RV64V_PMP_Set11
-    .global             ___RME_RV64V_PMP_Set12
-    .global             ___RME_RV64V_PMP_Set13
-    .global             ___RME_RV64V_PMP_Set14
-    .global             ___RME_RV64V_PMP_Set15
-    .global             ___RME_RV64V_PMP_Set16
     /* OpenSBI (SBI) service helpers */
     .global             ___RME_RV64V_Sbi_Call
     .global             ___RME_RV64V_Time_Get
@@ -153,7 +136,45 @@ F31    $ft11      temporary (caller-save)
     .align              3
 
 _start:
-    /* Set GP and SP */
+    /* OpenSBI enters at the physical load address with the MMU off. Build a
+     * bootstrap root table with two 1GB leaves:
+     *   top[2]   - identity map of physical [0x80000000,0xC0000000), needed
+     *              for the few instructions right after satp is enabled;
+     *   top[258] - the same range at the high-half kernel VA.
+     * PC-relative LA yields the physical address here and the high VA later,
+     * so the same code works before and after the switch. */
+    LA                  t0,__RME_Boot_Root
+    LI                  t1,512
+    MV                  t2,t0
+__RME_Boot_Root_Clear:
+    SD                  zero,(t2)
+    ADDI                t2,t2,8
+    ADDI                t1,t1,-1
+    BNEZ                t1,__RME_Boot_Root_Clear
+
+    /* PTE = PPN(0x80000000)<<10 | V|R|W|X (U must stay 0 for the kernel) */
+    LI                  t3,0x2000000F
+    SD                  t3,16(t0)               /* top[2], identity */
+    LI                  t2,2048
+    ADD                 t2,t0,t2
+    SD                  t3,16(t2)               /* top[258], high half */
+
+    /* satp = MODE(Sv39=8)<<60 | PPN(root) */
+    SRLI                t4,t0,12
+    LI                  t5,8
+    SLLI                t5,t5,60
+    OR                  t4,t4,t5
+    CSRW                satp,t4
+    SFENCE.VMA          x0,x0
+
+    /* Jump into the high half (LA gives the physical address here) */
+    LA                  t0,__RME_RV64V_Boot_High
+    LI                  t1,0xFFFFFFC000000000
+    ADD                 t0,t0,t1
+    JR                  t0
+
+__RME_RV64V_Boot_High:
+    /* Now executing at the high-half VA */
     .option             push
     .option             norelax
     LA                  gp,__RME_Global
@@ -162,31 +183,30 @@ _start:
     CSRW                sscratch,sp
     LA                  t0,__RME_RV64V_Handler
     CSRW                stvec,t0
-    /* Preinitialize hardware before any initialization */
-    CALL                __RME_RV64V_Lowlvl_Preinit
-    /* Load data section from the load address to RAM */
-    LA                  a0,__RME_Data_Load
-    LA                  a1,__RME_Data_Start
-    LA                  a2,__RME_Data_End
-__RME_Data_Load:
-    BEQ                 a1,a2,__RME_Data_Done
-    LW                  t0,(a0)
-    SW                  t0,(a1)
-    ADDI                a0,a0,4
-    ADDI                a1,a1,4
-    J                   __RME_Data_Load
-__RME_Data_Done:
-    /* Clear bss zero section */
+
+    /* Clear the bss section. The data section needs no copy: the high-half
+     * mapping points straight at the physical load address. */
     LA                  a0,__RME_Zero_Start
     LA                  a1,__RME_Zero_End
 __RME_Zero_Clear:
     BEQ                 a0,a1,__RME_Zero_Done
-    SW                  zero,(a0)
-    ADDI                a0,a0,4
+    SD                  zero,(a0)
+    ADDI                a0,a0,8
     J                   __RME_Zero_Clear
 __RME_Zero_Done:
+
+    /* Preinitialize hardware before any initialization */
+    CALL                __RME_RV64V_Lowlvl_Preinit
     /* Branch to main function */
     J                   main
+
+/* Bootstrap root page table - the loader does not zero it, _start programs it
+ * explicitly, and it must survive the .bss clear below. */
+    .section            .bootpgt, "aw", @nobits
+    .align              12
+
+__RME_Boot_Root:
+    .space              4096
 /* End Entry *****************************************************************/
 
 /* Function:__RME_Int_Disable *************************************************
@@ -331,6 +351,38 @@ ___RME_RV64V_SSTATUS_Set:
     CSRW                sstatus, a0
     RET
 /* End Function:___RME_RV64V_SSTATUS_Set *************************************/
+
+/* Function:___RME_RV64V_SATP_Set *********************************************
+Description : Write the satp register to enable/switch the Sv39 MMU.
+              satp layout: [63:60] MODE = 8 (Sv39), [59:44] ASID,
+              [43:0] PPN = root page table physical address >> 12.
+Input       : a0 - The satp value.
+Output      : None.
+Return      : None.
+******************************************************************************/
+    .section            .text.___rme_rv64v_satp_set
+    .align              3
+
+___RME_RV64V_SATP_Set:
+    CSRW                satp,a0
+    RET
+/* End Function:___RME_RV64V_SATP_Set ****************************************/
+
+/* Function:___RME_RV64V_TLB_Flush ********************************************
+Description : Flush all address-translation cache (TLB) entries.
+              SFENCE.VMA with rs1=rs2=x0 flushes the whole TLB; on a
+              single-core system this is all we ever need.
+Input       : None.
+Output      : None.
+Return      : None.
+******************************************************************************/
+    .section            .text.___rme_rv64v_tlb_flush
+    .align              3
+
+___RME_RV64V_TLB_Flush:
+    SFENCE.VMA          x0,x0
+    RET
+/* End Function:___RME_RV64V_TLB_Flush ****************************************/
 
 /* Function:__RME_User_Enter **************************************************
 Description : Entering of the user mode, after the system finish its preliminary
@@ -940,293 +992,6 @@ ___RME_RV64V_Thd_Cop_Load_RVD:
     .hword              0x0F85
     RET
 /* End Function:___RME_RV64V_Thd_Cop_Load ************************************/
-
-/* Function:___RME_RV64V_PMP_Set **********************************************
-Description : Program the entire PMP array.
-Input       : a0 - The PMP metadata.
-Output      : None.
-Return      : None.
-******************************************************************************/
-    /* Configuration registers */
-    .macro              PMPCFG_SET1
-    LW                  t0,0*4(a0)
-    CSRW                pmpcfg0,t0
-    .endm
-
-    .macro              PMPCFG_SET2
-    PMPCFG_SET1
-    LW                  t0,1*4(a0)
-    CSRW                pmpcfg1,t0
-    .endm
-
-    .macro              PMPCFG_SET3
-    PMPCFG_SET2
-    LW                  t0,2*4(a0)
-    CSRW                pmpcfg2,t0
-    .endm
-
-    .macro              PMPCFG_SET4
-    PMPCFG_SET3
-    LW                  t0,3*4(a0)
-    CSRW                pmpcfg3,t0
-    .endm
-
-    /* Address registers */
-    .macro              PMPADDR_SET1
-    LW                  t0,0*4(a0)
-    CSRW                pmpaddr0,t0
-    .endm
-
-    .macro              PMPADDR_SET2
-    PMPADDR_SET1
-    LW                  t0,1*4(a0)
-    CSRW                pmpaddr1,t0
-    .endm
-
-    .macro              PMPADDR_SET3
-    PMPADDR_SET2
-    LW                  t0,2*4(a0)
-    CSRW                pmpaddr2,t0
-    .endm
-
-    .macro              PMPADDR_SET4
-    PMPADDR_SET3
-    LW                  t0,3*4(a0)
-    CSRW                pmpaddr3,t0
-    .endm
-
-    .macro              PMPADDR_SET5
-    PMPADDR_SET4
-    LW                  t0,4*4(a0)
-    CSRW                pmpaddr4,t0
-    .endm
-
-    .macro              PMPADDR_SET6
-    PMPADDR_SET5
-    LW                  t0,5*4(a0)
-    CSRW                pmpaddr5,t0
-    .endm
-
-    .macro              PMPADDR_SET7
-    PMPADDR_SET6
-    LW                  t0,6*4(a0)
-    CSRW                pmpaddr6,t0
-    .endm
-
-    .macro              PMPADDR_SET8
-    PMPADDR_SET7
-    LW                  t0,7*4(a0)
-    CSRW                pmpaddr7,t0
-    .endm
-
-    .macro              PMPADDR_SET9
-    PMPADDR_SET8
-    LW                  t0,8*4(a0)
-    CSRW                pmpaddr8,t0
-    .endm
-
-    .macro              PMPADDR_SET10
-    PMPADDR_SET9
-    LW                  t0,9*4(a0)
-    CSRW                pmpaddr9,t0
-    .endm
-
-    .macro              PMPADDR_SET11
-    PMPADDR_SET10
-    LW                  t0,10*4(a0)
-    CSRW                pmpaddr10,t0
-    .endm
-
-    .macro              PMPADDR_SET12
-    PMPADDR_SET11
-    LW                  t0,11*4(a0)
-    CSRW                pmpaddr11,t0
-    .endm
-
-    .macro              PMPADDR_SET13
-    PMPADDR_SET12
-    LW                  t0,12*4(a0)
-    CSRW                pmpaddr12,t0
-    .endm
-
-    .macro              PMPADDR_SET14
-    PMPADDR_SET13
-    LW                  t0,13*4(a0)
-    CSRW                pmpaddr13,t0
-    .endm
-
-    .macro              PMPADDR_SET15
-    PMPADDR_SET14
-    LW                  t0,14*4(a0)
-    CSRW                pmpaddr14,t0
-    .endm
-
-    .macro              PMPADDR_SET16
-    PMPADDR_SET15
-    LW                  t0,15*4(a0)
-    CSRW                pmpaddr15,t0
-    .endm
-
-/* 1-range version */
-    .section            .text.___rme_rv64v_pmp_set1
-    .align              3
-
-___RME_RV64V_PMP_Set1:
-    PMPCFG_SET1
-    ADDI                a0,a0,1*4
-    PMPADDR_SET1
-    RET
-
-/* 2-range version */
-    .section            .text.___rme_rv64v_pmp_set2
-    .align              3
-
-___RME_RV64V_PMP_Set2:
-    PMPCFG_SET1
-    ADDI                a0,a0,1*4
-    PMPADDR_SET2
-    RET
-
-/* 3-range version */
-    .section            .text.___rme_rv64v_pmp_set3
-    .align              3
-
-___RME_RV64V_PMP_Set3:
-    PMPCFG_SET1
-    ADDI                a0,a0,1*4
-    PMPADDR_SET3
-    RET
-
-/* 4-range version */
-    .section            .text.___rme_rv64v_pmp_set4
-    .align              3
-
-___RME_RV64V_PMP_Set4:
-    PMPCFG_SET1
-    ADDI                a0,a0,1*4
-    PMPADDR_SET4
-    RET
-
-/* 5-range version */
-    .section            .text.___rme_rv64v_pmp_set5
-    .align              3
-
-___RME_RV64V_PMP_Set5:
-    PMPCFG_SET2
-    ADDI                a0,a0,2*4
-    PMPADDR_SET5
-    RET
-
-/* 6-range version */
-    .section            .text.___rme_rv64v_pmp_set6
-    .align              3
-
-___RME_RV64V_PMP_Set6:
-    PMPCFG_SET2
-    ADDI                a0,a0,2*4
-    PMPADDR_SET6
-    RET
-
-/* 7-range version */
-    .section            .text.___rme_rv64v_pmp_set7
-    .align              3
-
-___RME_RV64V_PMP_Set7:
-    PMPCFG_SET2
-    ADDI                a0,a0,2*4
-    PMPADDR_SET7
-    RET
-
-/* 8-range version */
-    .section            .text.___rme_rv64v_pmp_set8
-    .align              3
-
-___RME_RV64V_PMP_Set8:
-    PMPCFG_SET2
-    ADDI                a0,a0,2*4
-    PMPADDR_SET8
-    RET
-
-/* 9-range version */
-    .section            .text.___rme_rv64v_pmp_set9
-    .align              3
-
-___RME_RV64V_PMP_Set9:
-    PMPCFG_SET3
-    ADDI                a0,a0,3*4
-    PMPADDR_SET9
-    RET
-
-/* 10-range version */
-    .section            .text.___rme_rv64v_pmp_set10
-    .align              3
-
-___RME_RV64V_PMP_Set10:
-    PMPCFG_SET3
-    ADDI                a0,a0,3*4
-    PMPADDR_SET10
-    RET
-
-/* 11-range version */
-    .section            .text.___rme_rv64v_pmp_set11
-    .align              3
-
-___RME_RV64V_PMP_Set11:
-    PMPCFG_SET3
-    ADDI                a0,a0,3*4
-    PMPADDR_SET11
-    RET
-
-/* 12-range version */
-    .section            .text.___rme_rv64v_pmp_set12
-    .align              3
-
-___RME_RV64V_PMP_Set12:
-    PMPCFG_SET3
-    ADDI                a0,a0,3*4
-    PMPADDR_SET12
-    RET
-
-/* 13-range version */
-    .section            .text.___rme_rv64v_pmp_set13
-    .align              3
-
-___RME_RV64V_PMP_Set13:
-    PMPCFG_SET4
-    ADDI                a0,a0,4*4
-    PMPADDR_SET13
-    RET
-
-/* 14-range version */
-    .section            .text.___rme_rv64v_pmp_set14
-    .align              3
-
-___RME_RV64V_PMP_Set14:
-    PMPCFG_SET4
-    ADDI                a0,a0,4*4
-    PMPADDR_SET14
-    RET
-
-/* 15-range version */
-    .section            .text.___rme_rv64v_pmp_set15
-    .align              3
-
-___RME_RV64V_PMP_Set15:
-    PMPCFG_SET4
-    ADDI                a0,a0,4*4
-    PMPADDR_SET15
-    RET
-
-/* 16-range version */
-    .section            .text.___rme_rv64v_pmp_set16
-    .align              3
-
-___RME_RV64V_PMP_Set16:
-    PMPCFG_SET4
-    ADDI                a0,a0,4*4
-    PMPADDR_SET16
-    RET
-/* End Function:___RME_RV64V_PMP_Set *****************************************/
 
 /* Function:___RME_RV64V_Sbi_Call *********************************************
 Description : Generic OpenSBI call. SBI convention: a7 = extension/function ID,
