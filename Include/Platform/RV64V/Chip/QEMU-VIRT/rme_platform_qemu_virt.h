@@ -10,14 +10,12 @@ Description : The configuration file for the QEMU virt platform.
 /* Debugging *****************************************************************/
 #define RME_ASSERT_ENABLE                               (1U)
 #define RME_DBGLOG_ENABLE                               (1U)
-/* Generator *****************************************************************/
-/* Are we using the generator? */
-#define RME_RVM_GEN_ENABLE                              (0U)
 /* Are we using raw memory mappings? */
 #define RME_PGT_RAW_ENABLE                              (0U)
 /* Kernel ********************************************************************/
-/* Kernel object virtual memory base */
-#define RME_KOM_VA_BASE                                 (0x81000000U)
+/* Kernel object virtual memory base - kernel lives in the Sv39 high half:
+ * VA = 0xFFFFFFC000000000 + physical 0x81000000 (see RME_RV64V_VA_BASE) */
+#define RME_KOM_VA_BASE                                 (0xFFFFFFC081000000ULL)
 /* Kernel object virtual memory size */
 #define RME_KOM_VA_SIZE                                 (0xD000)
 /* Hypervisor context virtual memory base - set to 0 if no VM */
@@ -26,37 +24,28 @@ Description : The configuration file for the QEMU virt platform.
 #define RME_HYP_VA_SIZE                                 (0xFFFFFFFFU)
 /* Kernel memory allocation granularity order */
 #define RME_KOM_SLOT_ORDER                              (4U)
-/* Kernel stack size and address */
-#define RME_KSTK_VA_BASE                                (0x8100E000U)
+/* Kernel stack size and address - high half as well */
+#define RME_KSTK_VA_BASE                                (0xFFFFFFC08100E000ULL)
 #define RME_KSTK_VA_SIZE                                (0x800U)
 /* The maximum number of preemption priorities */
 #define RME_PREEMPT_PRIO_NUM                            (32U)
 
-/* Physical vector number, flag area base and size */
+/* Physical vector number */
 #define RME_RVM_PHYS_VCT_NUM                            (104U)
-#define RME_RVM_PHYS_VCTF_BASE                          (0x8100F000U)
-#define RME_RVM_PHYS_VCTF_SIZE                          (0x40U)
-/* Virtual event number, flag area base and size */
-#define RME_RVM_VIRT_EVT_NUM                            (32U)
-#define RME_RVM_VIRT_EVTF_BASE                          (0x8100EFC0U)
-#define RME_RVM_VIRT_EVTF_SIZE                          (0x20U)
 /* Size of initial capability table */
 #define RME_RVM_INIT_CPT_SIZE                           (54U)
-/* Initial kernel object frontier limit */
-#define RME_RVM_CPT_BOOT_FRONT                          (9U)
-#define RME_RVM_KOM_BOOT_FRONT                          (0x1000U)
-/* Post-boot kernel object frontier limit */
-#define RME_RVM_CPT_DONE_FRONT                          (22U)
-#define RME_RVM_KOM_DONE_FRONT                          (0x1C10U)
+/* Initial kernel object frontier limit. Must hold the capability table, the
+ * three Sv39 page tables (12KB) and the first thread. */
+#define RME_RVM_KOM_BOOT_FRONT                          (0x8000U)
 
-/* Init process's first thread's entry point address */
-#define RME_RV64V_INIT_ENTRY                            (0x81030000U)
-/* Init process's first thread's stack address */
-#define RME_RV64V_INIT_STACK                            (0x81020000U)
+/* Init process's first thread - user virtual addresses, decoupled from the
+ * physical pages, matching X64 (first user program at 0x20000000 with its
+ * stack about 2MB above it). The code is loaded physically at 0x81030000 and
+ * the stack physically occupies [0x81010000,0x81020000). */
+#define RME_RV64V_INIT_ENTRY                            (0x20000000U)
+#define RME_RV64V_INIT_STACK                            (0x20200000U)
 /* What is the Systick value? - 10ms per tick*/
 #define RME_RV64V_OSTIM_VAL                             (100000U)
-/* Number of MPU regions available - nonstandard implementation, only 3 available */
-#define RME_RV64V_REGION_NUM                            (3U)
 /* What is the FPU type? */
 #define RME_COP_NUM                                     (1U)
 #define RME_RV64V_COP_RVF                               (1U)

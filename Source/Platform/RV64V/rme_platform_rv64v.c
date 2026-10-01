@@ -145,7 +145,6 @@ void __RME_RV64V_Exc_Handler(struct RME_Reg_Struct* Reg,
     rme_ptr_t Flag;
     struct RME_Cap_Prc* Prc;
     struct RME_Inv_Struct* Inv_Top;
-    struct __RME_RV64V_Pgt_Meta* Meta;
 #endif
     struct RME_Thd_Struct* Thd_Cur;
     struct RME_Exc_Struct* Exc;
@@ -173,9 +172,11 @@ void __RME_RV64V_Exc_Handler(struct RME_Reg_Struct* Reg,
         case RME_RV64V_SCAUSE_S_ECALL:
         case RME_RV64V_SCAUSE_H_ECALL:
         case RME_RV64V_SCAUSE_M_ECALL:
-        case RME_RV64V_SCAUSE_IPGFLT:
-        case RME_RV64V_SCAUSE_LPGFLT:
-        case RME_RV64V_SCAUSE_SPGFLT:
+        /* Sv39 access faults are genuine hardware violations - there is no
+         * PMP cache to lazily populate anymore, so they are not recoverable */
+        case RME_RV64V_SCAUSE_IACCFLT:
+        case RME_RV64V_SCAUSE_LACCFLT:
+        case RME_RV64V_SCAUSE_SACCFLT:
         {
             Exc->Cause=Scause;
             Exc->Addr=Reg->PC;
@@ -183,10 +184,11 @@ void __RME_RV64V_Exc_Handler(struct RME_Reg_Struct* Reg,
             _RME_Thd_Fatal(Reg);
             return;
         }
-        /* Try to recover from PMP issues - could be dynamic pages */
-        case RME_RV64V_SCAUSE_IACCFLT:
-        case RME_RV64V_SCAUSE_LACCFLT:
-        case RME_RV64V_SCAUSE_SACCFLT: break;
+        /* Page faults - the page may have just been mapped and the TLB still
+         * holds a stale entry. Try to recover by walking the page table. */
+        case RME_RV64V_SCAUSE_IPGFLT:
+        case RME_RV64V_SCAUSE_LPGFLT:
+        case RME_RV64V_SCAUSE_SPGFLT: break;
     }
 
     Inv_Top=RME_INVSTK_TOP(Thd_Cur);
@@ -205,22 +207,10 @@ void __RME_RV64V_Exc_Handler(struct RME_Reg_Struct* Reg,
         return;
     }
 
-    /* We found the page, and need to update the PMP cache. It could be:
-     * (1) a dynamic page,
-     * (2) a static page on first occurrence,
-     * (3) a static page swapping out another static page. */
-    Meta=RME_CAP_GETOBJ(Prc->Pgt,struct __RME_RV64V_Pgt_Meta*);
-    if(___RME_RV64V_PMP_Update(Meta,Paddr,Size_Order,Flag)!=0)
-    {
-        Exc->Cause=Scause;
-        Exc->Addr=Reg->PC;
-        Exc->Value=Mtval;
-        _RME_Thd_Fatal(Reg);
-        return;
-    }
-
-    /* Reload current PMP data */
-    __RME_Pgt_Set(Prc->Pgt);
+    /* The page is mapped. Under Sv39 the hardware walks the table itself, so
+     * a fault on an existing page means a stale TLB entry - flush and retry
+     * the faulting instruction. */
+    ___RME_RV64V_TLB_Flush();
 #else
     Exc->Cause=Scause;
     Exc->Addr=Reg->PC;
@@ -229,55 +219,6 @@ void __RME_RV64V_Exc_Handler(struct RME_Reg_Struct* Reg,
 #endif
 }
 /* End Function:__RME_RV64V_Exc_Handler **************************************/
-
-/* Function:__RME_RV64V_Flag_Fast *********************************************
-Description : Set a fast flag in a flag set. Works for timer interrupts only.
-Input       : rme_ptr_t Base - The base address of the flagset.
-              rme_ptr_t Size - The size of the flagset.
-              rme_ptr_t Flag - The fast flagset to program.
-Output      : None.
-Return      : None.
-******************************************************************************/
-void __RME_RV64V_Flag_Fast(rme_ptr_t Base,
-                           rme_ptr_t Size,
-                           rme_ptr_t Flag)
-{
-    volatile struct __RME_RVM_Flag* Set;
-
-    /* Choose a data structure that is not locked at the moment */
-    Set=RME_RVM_FLAG_SET(Base,Size,0U);
-    if(Set->Lock!=0U)
-        Set=RME_RVM_FLAG_SET(Base,Size,1U);
-
-    /* Set the flags for this interrupt source */
-    Set->Fast|=Flag;
-}
-/* End Function:__RME_RV64V_Flag_Fast ****************************************/
-
-/* Function:__RME_RV64V_Flag_Slow *********************************************
-Description : Set a slow flag in a flag set. Works for both vectors and events.
-Input       : rme_ptr_t Base - The base address of the flagset.
-              rme_ptr_t Size - The size of the flagset.
-              rme_ptr_t Pos - The position in the flagset to set.
-Output      : None.
-Return      : None.
-******************************************************************************/
-void __RME_RV64V_Flag_Slow(rme_ptr_t Base,
-                           rme_ptr_t Size,
-                           rme_ptr_t Pos)
-{
-    volatile struct __RME_RVM_Flag* Set;
-    
-    /* Choose a data structure that is not locked at the moment */
-    Set=RME_RVM_FLAG_SET(Base,Size,0U);
-    if(Set->Lock!=0U)
-        Set=RME_RVM_FLAG_SET(Base,Size,1U);
-    
-    /* Set the flags for this interrupt source */
-    Set->Group|=RME_POW2(Pos>>RME_WORD_ORDER);
-    Set->Flag[Pos>>RME_WORD_ORDER]|=RME_POW2(Pos&RME_MASK_END(RME_WORD_ORDER-1U));
-}
-/* End Function:__RME_RV64V_Flag_Slow ****************************************/
 
 /* Function:_RME_RV64V_Handler ************************************************
 Description : The generic interrupt handler of RME for RV64V, in C.
@@ -299,31 +240,16 @@ void _RME_RV64V_Handler(struct RME_Reg_Struct* Reg)
 
         RME_RV64V_Timestamp++;
 
-#if(RME_RVM_GEN_ENABLE!=0U)
-        __RME_RV64V_Flag_Fast(RME_RVM_PHYS_VCTF_BASE,RME_RVM_PHYS_VCTF_SIZE,1U);
-#endif
-
         _RME_Tim_Handler(Reg,1U);
     }
     /* Vector handler */
     else if((Scause&RME_RV64V_SCAUSE_INT)!=0U)
     {
-        Scause&=0x7FFFFFFFFFFFFFFFU;
 
-#if(RME_RVM_GEN_ENABLE!=0U)
-        /* If the user wants to bypass, we skip the flag marshalling & sending process */
-        if(RME_Boot_Vct_Handler(Reg,Scause)!=0U)
-        {
-            /* Set the vector flag */
-            __RME_RV64V_Flag_Slow(RME_RVM_PHYS_VCTF_BASE,RME_RVM_PHYS_VCTF_SIZE,Scause);
-#endif
-            /* Send to the kernel endpoint */
-            _RME_Kern_Snd(RME_RV64V_Local.Sig_Vct,1U);
-            /* Pick the highest priority thread after we did all sends */
-            _RME_Kern_High(Reg,&RME_RV64V_Local);
-#if(RME_RVM_GEN_ENABLE!=0U)
-        }
-#endif
+        /* Send to the kernel endpoint */
+        _RME_Kern_Snd(RME_RV64V_Local.Sig_Vct,1U);
+        /* Pick the highest priority thread after we did all sends */
+        _RME_Kern_High(Reg,&RME_RV64V_Local);
     }
     /* System call handler */
     else if(Scause==RME_RV64V_SCAUSE_U_ECALL)
@@ -458,35 +384,6 @@ rme_ret_t __RME_RV64V_Int_Local_Trig(rme_ptr_t CPUID,
     return 0;
 }
 /* End Function:__RME_RV64V_Int_Local_Trig ***********************************/
-
-/* Function:__RME_RV64V_Evt_Local_Trig ****************************************
-Description : Trigger a CPU's local event source.
-Input       : struct RME_Reg_Struct* Reg - The register set.
-              rme_ptr_t CPUID - The ID of the CPU.
-              rme_ptr_t Evt_Num - The event ID.
-Output      : None.
-Return      : rme_ret_t - If successful, 0; else RME_ERR_KFN_FAIL.
-******************************************************************************/
-rme_ret_t __RME_RV64V_Evt_Local_Trig(struct RME_Reg_Struct* Reg,
-                                     rme_ptr_t CPUID,
-                                     rme_ptr_t Evt_Num)
-{
-    if(Evt_Num>=RME_RVM_VIRT_EVT_NUM)
-        return RME_ERR_KFN_FAIL;
-
-    __RME_RV64V_Flag_Slow(RME_RVM_VIRT_EVTF_BASE,RME_RVM_VIRT_EVTF_SIZE,Evt_Num);
-    
-    if(_RME_Kern_Snd(RME_RV64V_Local.Sig_Vct,1U)!=0U)
-        return RME_ERR_KFN_FAIL;
-    
-    /* Set return value first before we really do context switch */
-    __RME_Svc_Retval_Set(Reg,0);
-    
-    _RME_Kern_High(Reg,&RME_RV64V_Local);
-
-    return 0U;
-}
-/* End Function:__RME_RV64V_Evt_Local_Trig ***********************************/
 
 /* Function:__RME_RV64V_Cache_Mod *********************************************
 Description : Modify cache state. We do not make assumptions about cache contents.
@@ -833,12 +730,7 @@ rme_ret_t __RME_Kfn_Handler(struct RME_Cap_Cpt* Cpt,
                                               Param1);
             break;
         }
-        case RME_KFN_EVT_LOCAL_TRIG:
-        {
-            return __RME_RV64V_Evt_Local_Trig(Reg,      /* May ctxsw */
-                                              Sub_ID,
-                                              Param1);
-        }
+        case RME_KFN_EVT_LOCAL_TRIG:    {return RME_ERR_KFN_FAIL;}
 /* Cache operations **********************************************************/
         case RME_KFN_CACHE_MOD:
         {
@@ -971,14 +863,7 @@ rme_ret_t __RME_Kfn_Handler(struct RME_Cap_Cpt* Cpt,
 /* User-defined operations ***************************************************/
         default:
         {
-#if(RME_RVM_GEN_ENABLE!=0U)
-            Retval=RME_Hook_Kfn_Handler(Func_ID,
-                                        Sub_ID,
-                                        Param1,
-                                        Param2);
-#else
             return RME_ERR_KFN_FAIL;
-#endif
         }
     }
 
@@ -1000,10 +885,6 @@ Return      : None.
 void __RME_RV64V_Lowlvl_Preinit(void)
 {
     RME_RV64V_LOWLVL_PREINIT();
-    
-#if(RME_RVM_GEN_ENABLE!=0U)
-    RME_Boot_Pre_Init();
-#endif
 }
 /* End Function:__RME_RV64V_Lowlvl_Preinit ***********************************/
 
@@ -1032,67 +913,87 @@ void __RME_Boot(void)
 {
     /* volatile rme_ptr_t Size; */
     rme_ptr_t Cur_Addr;
-#if(RME_PGT_RAW_ENABLE!=0U)
-    /* Initial array for raw page table mode - generic for all RV32 */
-#if(RME_RV32_REGION_NUM<=4U)
-    static const rme_ptr_t RME_RV64V_Raw_Pgt_Def[5U]=
-    {
-        0x1818181FU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU
-    };
-#elif(RME_RV32_REGION_NUM<=8U)
-    static const rme_ptr_t RME_RV64V_Raw_Pgt_Def[10U]=
-    {
-        0x1818181FU,0x18181818U,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU
-    };
-#elif(RME_RV32_REGION_NUM<=12U)
-    static const rme_ptr_t RME_RV64V_Raw_Pgt_Def[15U]=
-    {
-        0x1818181FU,0x18181818U,0x18181818U,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU
-    };
-#else
-    static const rme_ptr_t RME_RV64V_Raw_Pgt_Def[20U]=
-    {
-        0x1818181FU,0x18181818U,0x18181818U,0x18181818U,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,
-        0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU,0xFFFFFFFFU
-    };
-#endif
-#endif
-
+    rme_cnt_t Count;
     Cur_Addr=RME_KOM_VA_BASE;
 
     /* Create the capability table for the init process */
-    RME_ASSERT(_RME_Cpt_Boot_Init(RME_BOOT_INIT_CPT,
-                                  Cur_Addr,
-                                  RME_RVM_INIT_CPT_SIZE)==0);
-    Cur_Addr+=RME_KOM_ROUND(RME_CPT_SIZE(RME_RVM_INIT_CPT_SIZE));
+    RME_ASSERT(_RME_Cpt_Boot_Init(RME_BOOT_INIT_CPT,Cur_Addr,16)==RME_BOOT_INIT_CPT);
+    Cur_Addr+=RME_KOM_ROUND(RME_CPT_SIZE(16));
 
-    /* Create the page table for the init process, and map in the page alloted for it */
-#if(RME_PGT_RAW_ENABLE==0U)
-    /* The top-level page table - covers 4G address range */
+    /* Sv39 locates a page table through its PPN, so every table object must be
+     * 4KB aligned (the KOM allocation granularity is only 16 bytes) */
+    Cur_Addr=RME_ROUND_UP(Cur_Addr,12);
+
+    /* The top-level (root) page table - one entry per 1GB. Its high half is
+     * pre-filled with the shared kernel mappings by __RME_Pgt_Init. */
     RME_ASSERT(_RME_Pgt_Boot_Crt(RME_RV64V_CPT,
                                  RME_BOOT_INIT_CPT,
                                  RME_BOOT_INIT_PGT,
                                  Cur_Addr,
                                  0x00000000U,
                                  RME_PGT_TOP,
-                                 RME_PGT_SIZE_4G,
-                                 RME_PGT_NUM_1)==0);
-    Cur_Addr+=RME_KOM_ROUND(RME_PGT_SIZE_TOP(RME_PGT_NUM_1));
-    /* Other memory regions will be directly added, because we do not protect them in the init process */
-    RME_ASSERT(_RME_Pgt_Boot_Add(RME_RV64V_CPT,
-                                 RME_BOOT_INIT_PGT,
+                                 RME_PGT_SIZE_1G,
+                                 RME_PGT_NUM_512)==0);
+    Cur_Addr+=RME_KOM_ROUND(RME_PGT_SIZE_TOP(RME_PGT_NUM_512));
+
+    /* The second-level page table for the init process's user address space.
+     * It covers [0, 1GB); only the user window below is populated, the rest of
+     * the low half stays unmapped so user mode cannot reach kernel memory. */
+    RME_ASSERT(_RME_Pgt_Boot_Crt(RME_RV64V_CPT,
+                                 RME_BOOT_INIT_CPT,
+                                 RME_BOOT_INIT_PGT_L1,
+                                 Cur_Addr,
                                  0x00000000U,
+                                 RME_PGT_NOM,
+                                 RME_PGT_SIZE_2M,
+                                 RME_PGT_NUM_512)==0);
+    Cur_Addr+=RME_KOM_ROUND(RME_PGT_SIZE_NOM(RME_PGT_NUM_512));
+
+    /* The third-level page table for the user window [0x20000000,0x20200000)
+     * at 4KB granularity, so only the init thread's own stack/code pages are
+     * mapped instead of a whole 2MB block. */
+    RME_ASSERT(_RME_Pgt_Boot_Crt(RME_RV64V_CPT,
+                                 RME_BOOT_INIT_CPT,
+                                 RME_BOOT_INIT_PGT_L2,
+                                 Cur_Addr,
+                                 0x20000000U,
+                                 RME_PGT_NOM,
+                                 RME_PGT_SIZE_4K,
+                                 RME_PGT_NUM_512)==0);
+    Cur_Addr+=RME_KOM_ROUND(RME_PGT_SIZE_NOM(RME_PGT_NUM_512));
+
+    /* Attach the second-level table to top entry 0 (0x20000000>>30 = 0) */
+    RME_ASSERT(_RME_Pgt_Boot_Con(RME_RV64V_CPT,
+                                 RME_BOOT_INIT_PGT,
+                                 0U,
+                                 RME_BOOT_INIT_PGT_L1,
+                                 RME_PGT_ALL_PERM)==0);
+
+    /* Attach the third-level table to L1 entry 256 (0x20000000>>21) */
+    RME_ASSERT(_RME_Pgt_Boot_Con(RME_RV64V_CPT,
+                                 RME_BOOT_INIT_PGT_L1,
+                                 256U,
+                                 RME_BOOT_INIT_PGT_L2,
+                                 RME_PGT_ALL_PERM)==0);
+
+    /* The init thread's user code at VA 0x20000000, backed by physical
+     * 0x81030000 where the loader placed the image. */
+    RME_ASSERT(_RME_Pgt_Boot_Add(RME_RV64V_CPT,
+                                 RME_BOOT_INIT_PGT_L2,
+                                 0x81030000U,
                                  0U,
                                  RME_PGT_ALL_PERM)==0);
+
+    /* The init thread's stack: VA [0x201F0000,0x20200000) -> physical
+     * [0x81010000,0x81020000); the stack pointer starts at 0x20200000. */
+    for(Count=0;Count<16;Count++)
+    {
+        RME_ASSERT(_RME_Pgt_Boot_Add(RME_RV64V_CPT,
+                                     RME_BOOT_INIT_PGT_L2,
+                                     0x81010000U+(((rme_ptr_t)Count)<<RME_PGT_SIZE_4K),
+                                     496U+(rme_ptr_t)Count,
+                                     RME_PGT_ALL_PERM)==0);
+    }
 
     /* Activate the first process - This process cannot be deleted */
     RME_ASSERT(_RME_Prc_Boot_Crt(RME_RV64V_CPT,
@@ -1100,13 +1001,6 @@ void __RME_Boot(void)
                                  RME_BOOT_INIT_PRC,
                                  RME_BOOT_INIT_CPT,
                                  RME_BOOT_INIT_PGT)==0U);
-#else
-    RME_ASSERT(_RME_Prc_Boot_Crt(RME_RV64V_CPT,
-                                 RME_BOOT_INIT_CPT,
-                                 RME_BOOT_INIT_PRC,
-                                 RME_BOOT_INIT_CPT,
-                                 (rme_ptr_t)RME_RV64V_Raw_Pgt_Def)==0U);
-#endif
 
     /* Create the initial kernel function capability, and kernel memory capability */
     RME_ASSERT(_RME_Kfn_Boot_Crt(RME_RV64V_CPT,
@@ -1125,10 +1019,6 @@ void __RME_Boot(void)
     RME_ASSERT(_RME_Sig_Boot_Crt(RME_RV64V_CPT,
                                  RME_BOOT_INIT_CPT,
                                  RME_BOOT_INIT_VCT)==0);
-
-    /* Clean up the region for vectors and events */
-    _RME_Clear((void*)RME_RVM_PHYS_VCTF_BASE,RME_RVM_PHYS_VCTF_SIZE);
-    _RME_Clear((void*)RME_RVM_VIRT_EVTF_BASE,RME_RVM_VIRT_EVTF_SIZE);
 
     /* Activate the first thread, and set its priority */
     RME_ASSERT(_RME_Thd_Boot_Crt(RME_RV64V_CPT,
@@ -1150,26 +1040,10 @@ void __RME_Boot(void)
     Size=RME_REG_SIZE(0U)+sizeof(struct RME_RV64V_Cop_Struct);
     Size=RME_THD_SIZE(0U); */
 
-    /* If generator is enabled for this project, generate what is required by the generator */
-#if(RME_RVM_GEN_ENABLE!=0U)
-    Cur_Addr=RME_Boot_Vct_Init(RME_RV64V_CPT,
-                               RME_BOOT_INIT_VCT+1U,
-                               Cur_Addr);
-#endif
-
     /* Before we go into user level, make sure that the kernel object allocation is within the limits */
-#if(RME_RVM_GEN_ENABLE!=0U)
-    RME_ASSERT(Cur_Addr==(RME_KOM_VA_BASE+RME_RVM_KOM_BOOT_FRONT));
-#else
     RME_ASSERT(Cur_Addr<(RME_KOM_VA_BASE+RME_RVM_KOM_BOOT_FRONT));
-#endif
 
-#if(RME_RVM_GEN_ENABLE!=0U)
-    /* Perform post initialization */
-    RME_Boot_Post_Init();
-#endif
-
-    /* Enable the PMP & interrupt */
+    /* Enable the MMU (satp) & interrupt */
 #if(RME_PGT_RAW_ENABLE==0U)
     RME_ASSERT(RME_CAP_IS_ROOT(RME_RV64V_Local.Thd_Cur->Sched.Prc->Pgt)!=0U);
 #endif
@@ -1761,102 +1635,63 @@ void __RME_Thd_Cop_Swap(rme_ptr_t Attr_New,
 #endif
 /* End Function:__RME_Thd_Cop_Swap *******************************************/
 
+/* Sv39 maps the RME flags directly onto the PTE bits, so the X64-style lookup
+ * tables are gone - see RME_RV64V_PGFLG_RME2NAT/NAT2RME in the header. */
+
+/* The kernel mapping template - filled by __RME_Pgt_Kom_Init and copied into
+ * the upper half of every top-level page table by __RME_Pgt_Init. */
+struct __RME_RV64V_Kern_Pgt RME_RV64V_Kpgt;
+
 /* Function:__RME_Pgt_Kom_Init ************************************************
-Description : Initialize the kernel mapping tables, so it can be added to all the
-              top-level page tables. In RV64V, we do not need to add such pages.
+Description : Initialize the kernel mapping template, so it can be copied into
+              every top-level page table. The kernel is mapped as one 1GB leaf
+              in the Sv39 high half, covering physical [0x80000000,0xC0000000)
+              where the image, the object memory and the stacks live.
 Input       : None.
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
 rme_ret_t __RME_Pgt_Kom_Init(void)
 {
-    /* Empty function, always immediately successful */
+    rme_cnt_t Count;
+    rme_ptr_t Pos;
+
+    for(Count=0;Count<RME_POW2(RME_PGT_NUM_512);Count++)
+        RME_RV64V_Kpgt.Root[Count]=0;
+
+    /* Top-level index of the high-half address that maps physical 0x80000000 */
+    Pos=(RME_RV64V_PA2VA(0x80000000U)>>RME_PGT_SIZE_1G)&0x1FFU;
+    RME_RV64V_Kpgt.Root[Pos]=RME_RV64V_MMU_PPN(0x80000000U)|RME_RV64V_MMU_V|
+                             RME_RV64V_MMU_R|RME_RV64V_MMU_W|RME_RV64V_MMU_X;
+
     return 0;
 }
 /* End Function:__RME_Pgt_Kom_Init *******************************************/
 
-/* Function:__RME_Pgt_Set *****************************************************
+/* Function:__RME_Pgt_Set ***************************************************
 Description : Set the processor's page table.
 Input       : struct RME_Cap_Pgt* Pgt - The capability to the root page table.
-              struct RME_Raw_Pgt* Pgt - The alternative raw page table.
 Output      : None.
 Return      : None.
 ******************************************************************************/
-#if(RME_PGT_RAW_ENABLE==0U)
 void __RME_Pgt_Set(struct RME_Cap_Pgt* Pgt)
-#else
-void __RME_Pgt_Set(rme_ptr_t Pgt)
-#endif
 {
-    struct __RME_RV64V_Raw_Pgt* Raw_Pgt;
+    rme_ptr_t Satp;
 
-#if(RME_PGT_RAW_ENABLE==0U)
-    struct __RME_RV64V_PMP_Data* PMP_Data;
+    /* The page table object lives in the kernel object memory (high half), so
+     * translate its VA to PA first. Build satp: [63:60] MODE = 8 (Sv39),
+     * [59:44] ASID = 0, [43:0] PPN = root_pa >> 12 (4KB aligned). */
+    Satp=(8ULL<<60)|
+         ((RME_RV64V_VA2PA(RME_CAP_GETOBJ(Pgt,rme_ptr_t))>>12)&0xFFFFFFFFFULL);
 
-    PMP_Data=(struct __RME_RV64V_PMP_Data*)(RME_CAP_GETOBJ(Pgt, rme_ptr_t)+
-                                            sizeof(struct __RME_RV64V_Pgt_Meta));
-    Raw_Pgt=&(PMP_Data->Raw);
-#else
-    Raw_Pgt=(struct __RME_RV64V_Raw_Pgt*)Pgt;
-#endif
-
-    /* The RV32P port loaded the raw page table into the PMP registers here
-     * to enforce memory protection. In S-mode (QEMU virt) PMP is M-mode
-     * only - touching it raises an illegal-instruction trap. Protection
-     * will come from the Sv39 MMU instead (milestone 2); until then this
-     * hardware load is intentionally a no-op. */
-    (void)Raw_Pgt;
+    /* Write satp to enable/switch the MMU, then flush the TLB so the new
+     * translation takes effect immediately */
+    ___RME_RV64V_SATP_Set(Satp);
+    ___RME_RV64V_TLB_Flush();
 }
-/* End Function:__RME_Pgt_Set ************************************************/
+/* End Function:__RME_Pgt_Set **********************************************/
 
-/* Function:__RME_Pgt_Init ****************************************************
-Description : Initialize the page table data structure, according to the capability.
-Input       : struct RME_Cap_Pgt* Pgt_Op - The page table to operate on.
-Output      : None.
-Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
-******************************************************************************/
-#if(RME_PGT_RAW_ENABLE==0U)
-rme_ret_t __RME_Pgt_Init(struct RME_Cap_Pgt* Pgt_Op)
-{
-    rme_ptr_t Count;
-    rme_ptr_t* Ptr;
-    rme_u8_t* Cfg;
-
-    /* Get the actual table */
-    Ptr=RME_CAP_GETOBJ(Pgt_Op, rme_ptr_t*);
-
-    /* Initialize the causal metadata */
-    ((struct __RME_RV64V_Pgt_Meta*)Ptr)->Base=Pgt_Op->Base;
-    ((struct __RME_RV64V_Pgt_Meta*)Ptr)->Order=Pgt_Op->Order;
-    Ptr+=sizeof(struct __RME_RV64V_Pgt_Meta)/sizeof(rme_ptr_t);
-
-    /* Is this a top-level? If it is, we need to clean up the PMP data */
-    if(((Pgt_Op->Base)&RME_PGT_TOP)!=0U)
-    {
-        ((struct __RME_RV64V_PMP_Data*)Ptr)->Static=0U;
-        for(Count=0U;Count<RME_RV64V_PMPCFG_NUM;Count++)
-            ((struct __RME_RV64V_PMP_Data*)Ptr)->Raw.Cfg[Count]=0U;
-        for(Count=0U;Count<RME_RV64V_REGION_NUM;Count++)
-            ((struct __RME_RV64V_PMP_Data*)Ptr)->Raw.Addr[Count]=0U;
-
-        /* "Nonexistent" entries appear as enabled but not allowing access for workaround */
-        Cfg=(rme_u8_t*)(((struct __RME_RV64V_PMP_Data*)Ptr)->Raw.Cfg);
-        for(Count=RME_RV64V_REGION_NUM;Count<RME_RV64V_PMPCFG_NUM*sizeof(rme_ptr_t);Count++)
-            Cfg[Count]=0x18U;
-
-        Ptr+=sizeof(struct __RME_RV64V_PMP_Data)/sizeof(rme_ptr_t);
-    }
-
-    /* Clean up the table itself - This is could be virtually unbounded if the user
-     * pass in some very large length value. Need to restrict this. */
-    for(Count=0U;Count<RME_POW2(RME_PGT_NMORD(Pgt_Op->Order));Count++)
-        Ptr[Count]=0U;
-
-    return 0;
-}
-/* End Function:__RME_Pgt_Init ***********************************************/
-
-/* Function:__RME_Pgt_Check ***************************************************
+/* Function:__RME_Pgt_Check *************************************************
 Description : Check if the page table parameters are feasible, according to the
               parameters. This is only used in page table creation.
 Input       : rme_ptr_t Base_Addr - The start mapping address.
@@ -1867,604 +1702,213 @@ Input       : rme_ptr_t Base_Addr - The start mapping address.
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Check(rme_ptr_t Base_Addr,
-                          rme_ptr_t Is_Top,
-                          rme_ptr_t Size_Order,
-                          rme_ptr_t Num_Order,
-                          rme_ptr_t Vaddr)
+rme_ret_t __RME_Pgt_Check(rme_ptr_t Base_Addr, rme_ptr_t Is_Top,
+                            rme_ptr_t Size_Order, rme_ptr_t Num_Order, rme_ptr_t Vaddr)
 {
-    if(Num_Order>RME_PGT_NUM_256)
-        return RME_ERR_HAL_FAIL;
-    if(Size_Order<RME_PGT_SIZE_4B)
-        return RME_ERR_HAL_FAIL;
-    if(Size_Order>RME_PGT_SIZE_4G)
-        return RME_ERR_HAL_FAIL;
-    if((Vaddr&0x03U)!=0U)
+    /* Is the table address aligned to 4kB? Sv39 finds the table through a PPN */
+    if((Vaddr&0xFFF)!=0)
         return RME_ERR_HAL_FAIL;
 
-    return 0U;
+    /* Sv39 has exactly three levels: 1GB (root), 2MB, then 4KB */
+    if((Size_Order!=RME_PGT_SIZE_1G)&&(Size_Order!=RME_PGT_SIZE_2M)&&
+       (Size_Order!=RME_PGT_SIZE_4K))
+        return RME_ERR_HAL_FAIL;
+
+    /* Only the top-level table uses 1GB entries, and it must use them */
+    if(((Size_Order==RME_PGT_SIZE_1G)^(Is_Top!=0))!=0)
+        return RME_ERR_HAL_FAIL;
+
+    /* Every Sv39 table has exactly 512 entries */
+    if(Num_Order!=RME_PGT_NUM_512)
+        return RME_ERR_HAL_FAIL;
+
+    return 0;
 }
-/* End Function:__RME_Pgt_Check **********************************************/
+/* End Function:__RME_Pgt_Check ********************************************/
 
-/* Function:__RME_Pgt_Del_Check ***********************************************
-Description : Check if the page table can be deleted. The table can only be
-              deleted when there are no down- or up- mappings.
-Input       : struct RME_Cap_Pgt Pgt_Op* - The page table to operate on.
+/* Function:__RME_Pgt_Init **************************************************
+Description : Initialize the page table data structure, according to the capability.
+Input       : struct RME_Cap_Pgt* - The capability to the page table to operate on.
+Output      : None.
+Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
+******************************************************************************/
+rme_ret_t __RME_Pgt_Init(struct RME_Cap_Pgt* Pgt_Op)
+{
+    rme_cnt_t Count;
+    rme_ptr_t* Ptr;
+
+    /* Get the actual table - the object memory IS the hardware table */
+    Ptr=RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*);
+
+    /* Every Sv39 table has 512 entries. The low half belongs to the process
+     * and starts empty; a top-level table also carries the shared kernel
+     * mappings in its high half so a satp switch keeps the kernel mapped. */
+    for(Count=0;Count<256;Count++)
+        Ptr[Count]=0;
+
+    if((Pgt_Op->Base&RME_PGT_TOP)!=0)
+    {
+        for(;Count<RME_POW2(RME_PGT_NUM_512);Count++)
+            Ptr[Count]=RME_RV64V_Kpgt.Root[Count];
+    }
+    else
+    {
+        for(;Count<RME_POW2(RME_PGT_NUM_512);Count++)
+            Ptr[Count]=0;
+    }
+
+    return 0;
+}
+/* End Function:__RME_Pgt_Init *********************************************/
+
+/* Function:__RME_Pgt_Del_Check *********************************************
+Description : Check if the page table can be deleted.
+Input       : struct RME_Cap_Pgt Pgt_Op* - The capability to the page table to operate on.
 Output      : None.
 Return      : rme_ret_t - If can be deleted, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
 rme_ret_t __RME_Pgt_Del_Check(struct RME_Cap_Pgt* Pgt_Op)
 {
-    /* No special property to check */
-    return 0;
-}
-/* End Function:__RME_Pgt_Del_Check ******************************************/
-
-/* Function:__RME_RV64V_Rand **************************************************
-Description : The random number generator used for random replacement policy.
-              RV64V have only one core, thus we make the LFSR local.
-Input       : None.
-Output      : None.
-Return      : rme_ptr_t - The random number returned.
-******************************************************************************/
-rme_ptr_t __RME_RV64V_Rand(void)
-{   
-    static rme_ptr_t LFSR=0xACE1ACE1U;
-    
-    if((LFSR&0x01U)!=0U)
-    {
-        LFSR>>=1;
-        LFSR^=0xB400B400U;
-    }
-    else
-        LFSR>>=1;
-    
-    return LFSR;
-}
-/* End Function:__RME_RV64V_Rand *********************************************/
-
-/* Function:___RME_RV64V_PMP_Decode *******************************************
-Description : Decode PMP register data into stuff easier for processing.
-Input       : struct __RME_RV64V_PMP_Data* Top_Data - The PMP data.
-Output      : struct __RME_RV64V_PMP_Range* Range - The decoded ranges.
-Return      : rme_ptr_t - The number of regions that are present.
-******************************************************************************/
-rme_ptr_t ___RME_RV64V_PMP_Decode(struct __RME_RV64V_PMP_Data* Top_Data,
-                                  struct __RME_RV64V_PMP_Range* Range)
-{
-    rme_ptr_t Data_Cnt;
-    rme_ptr_t Range_Cnt;
-    rme_u8_t* Cfg;
-
-    Data_Cnt=0U;
-    Range_Cnt=0U;
-    Cfg=(rme_u8_t*)(Top_Data->Raw.Cfg);
-
-    while(Data_Cnt<RME_RV64V_REGION_NUM)
-    {
-        /* This region itself contains data - NA4 won't be used */
-        if(Cfg[Data_Cnt]!=0U)
-        {
-            RME_ASSERT(RME_RV64V_PMP_MODE(Cfg[Data_Cnt])==RME_RV64V_PMP_NAPOT);
-            Range[Range_Cnt].Flag=RME_RV64V_PMP_PERM(Cfg[Data_Cnt]);
-            Range[Range_Cnt].Order_Div4=_RME_LSB_Generic(~Top_Data->Raw.Addr[Data_Cnt])+1U;
-            Range[Range_Cnt].Start_Div4=Top_Data->Raw.Addr[Data_Cnt]&RME_MASK_BEGIN(Range[Range_Cnt].Order_Div4);
-            /* Can't be UB here, all address [34:2] */
-            Range[Range_Cnt].End_Div4=Range[Range_Cnt].Start_Div4+RME_POW2(Range[Range_Cnt].Order_Div4);
-            Range_Cnt++;
-            Data_Cnt++;
-        }
-        /* The region itself is empty, but what it follows may contain data in TOR mode */
-        else
-        {
-            if((Data_Cnt<(RME_RV64V_REGION_NUM-1U))&&
-               (RME_RV64V_PMP_MODE(Cfg[Data_Cnt+1U])==RME_RV64V_PMP_TOR))
-            {
-                    Range[Range_Cnt].Flag=RME_RV64V_PMP_PERM(Cfg[Data_Cnt+1U]);
-                    Range[Range_Cnt].Start_Div4=Top_Data->Raw.Addr[Data_Cnt];
-                    Range[Range_Cnt].End_Div4=Top_Data->Raw.Addr[Data_Cnt+1U];
-                    Range[Range_Cnt].Order_Div4=0U;
-                    Range_Cnt++;
-                    Data_Cnt+=2U;
-            }
-            else
-                break;
-        }
-    }
-
-    return Range_Cnt;
-}
-/* End Function:___RME_RV64V_PMP_Decode **************************************/
-
-/* Function:___RME_RV64V_PMP_Range_Ins ****************************************
-Description : Make room for range insertion at a certain point.
-Input       : struct __RME_RV64V_PMP_Range* Range - The memory ranges.
-              rme_ptr_t Number - The number of memory ranges.
-              rme_ptr_t Pos - The position to insert before.
-Output      : struct __RME_RV64V_PMP_Range* Range - The changed ranges.
-Return      : None.
-******************************************************************************/
-void ___RME_RV64V_PMP_Range_Ins(struct __RME_RV64V_PMP_Range* Range,
-                                rme_ptr_t Number,
-                                rme_ptr_t Pos)
-{
-    rme_ptr_t Count;
-
-    for(Count=Number;Count>Pos;Count--)
-    {
-        Range[Count]=Range[Count-1U];
-    }
-}
-/* End Function:___RME_RV64V_PMP_Range_Ins ***********************************/
-
-/* Function:___RME_RV64V_PMP_Range_Del ****************************************
-Description : Delete a range at a certain point.
-Input       : struct __RME_RV64V_PMP_Range* Range - The memory ranges.
-              rme_ptr_t Number - The number of memory ranges.
-              rme_ptr_t Pos - The position to delete.
-Output      : struct __RME_RV64V_PMP_Range* Range - The changed ranges.
-Return      : None.
-******************************************************************************/
-void ___RME_RV64V_PMP_Range_Del(struct __RME_RV64V_PMP_Range* Range,
-                                rme_ptr_t Number,
-                                rme_ptr_t Pos)
-{
-    rme_ptr_t Count;
-
-    for(Count=Pos;Count<Number-1U;Count++)
-    {
-        Range[Count]=Range[Count+1U];
-    }
-}
-/* End Function:___RME_RV64V_PMP_Range_Del ***********************************/
-
-/* Function:___RME_RV64V_PMP_Range_Entry **************************************
-Description : Check the number of entries used with the regions.
-Input       : struct __RME_RV64V_PMP_Range* Range - The memory ranges.
-              rme_ptr_t Number - The number of memory ranges.
-Output      : None.
-Return      : rme_ptr_t - The number of entries used.
-******************************************************************************/
-rme_ptr_t ___RME_RV64V_PMP_Range_Entry(struct __RME_RV64V_PMP_Range* Range,
-                                       rme_ptr_t Number)
-{
-    rme_ptr_t Count;
-    rme_ptr_t Total;
-
-    Total=0U;
-
-    for(Count=0U;Count<Number;Count++)
-    {
-        /* TOR ranges use two entries */
-        if(Range[Count].Order_Div4==0U)
-        {
-            Total+=2U;
-        }
-        /* NAPOT ranges use one entry */
-        else
-        {
-            Total++;
-        }
-    }
-
-    return Total;
-}
-/* End Function:___RME_RV64V_PMP_Range_Entry *********************************/
-
-/* Function:___RME_RV64V_PMP_Range_Kick ***************************************
-Description : Find an entry that could be kicked out, except for the entry we
-              just added.
-Input       : struct __RME_RV64V_PMP_Range* Range - The memory ranges.
-              rme_ptr_t Number - The number of memory ranges.
-              rme_ptr_t Add - The position of entry just added.
-Output      : None.
-Return      : rme_ptr_t - The position to kick out.
-******************************************************************************/
-rme_ptr_t ___RME_RV64V_PMP_Range_Kick(struct __RME_RV64V_PMP_Range* Range,
-                                      rme_ptr_t Number,
-                                      rme_ptr_t Add)
-{
-    rme_ptr_t Rand;
-    rme_ptr_t Count;
-    rme_ptr_t Entry;
-
-    /* Try to kick a dynamic range */
-    Rand=__RME_RV64V_Rand();
-    for(Count=0U;Count<Number;Count++)
-    {
-        Entry=(Rand+Count)%Number;
-        if(Entry==Add)
-        {
-            continue;
-        }
-        else if((Range[Entry].Flag&RME_PGT_STATIC)==0U)
-        {
-            return Entry;
-        }
-    }
-
-    /* Cannot find a dynamic one, kick a static range */
-    Entry=Rand%Number;
-    if(Entry==Add)
-        Entry=(Entry+1U)%Number;
-
-    return Entry;
-}
-/* End Function:___RME_RV64V_PMP_Range_Kick **********************************/
-
-/* Function:___RME_RV64V_PMP_Add **********************************************
-Description : Add an entry into the ranges.
-Input       : struct __RME_RV64V_PMP_Range* Range - The memory ranges.
-              rme_ptr_t Number - The number of memory ranges.
-              rme_ptr_t Paddr - The physical address of the page to add.
-              rme_ptr_t Size_Order - The page size order.
-              rme_ptr_t Flag - The flags.
-Output      : struct __RME_RV64V_PMP_Range* Range - The changed ranges.
-Return      : rme_ret_t - If successful, the current number of ranges; else
-                          RME_ERR_HAL_FAIL.
-******************************************************************************/
-rme_ret_t ___RME_RV64V_PMP_Add(struct __RME_RV64V_PMP_Range* Range,
-                               rme_ptr_t Number,
-                               rme_ptr_t Paddr,
-                               rme_ptr_t Size_Order,
-                               rme_ptr_t Flag)
-{
-    rme_ptr_t Count;
-    rme_ptr_t Start_Div4;
-    rme_ptr_t End_Div4;
-    rme_ptr_t Size_Div4;
-    rme_ptr_t Order_Div4;
-    rme_ptr_t Left;
-    rme_ptr_t Right;
-    rme_ptr_t Number_New;
-
-    /* All PMP addresses are [33:2], thus no UB */
-    Start_Div4=Paddr>>2U;
-    Order_Div4=Size_Order-2U;
-    End_Div4=Start_Div4+RME_POW2(Order_Div4);
-
-    /* There are existing entries, look them up */
-    Left=0U;
-    Right=0U;
-    if(Number!=0U)
-    {
-        /* Mapping in a 4GiB page. nothing must be existent, or we have a fault */
-        if(Size_Order>=RME_WORD_BIT)
-            return RME_ERR_HAL_FAIL;
-        /* Mapping in a page smaller than 4GiB */
-        else
-        {
-            /* Is this ever in the ranges? If yes, then there must be a permission conflict */
-            for(Count=0U;Count<Number;Count++)
-            {
-                if(((Start_Div4>=Range[Number].Start_Div4)&&(Start_Div4<Range[Number].End_Div4))||
-                   ((End_Div4>=Range[Number].Start_Div4)&&(End_Div4<Range[Number].End_Div4)))
-                {
-                    return RME_ERR_HAL_FAIL;
-                }
-            }
-
-            /* No. Find the possible position of this page between the ranges */
-            for(Count=0U;Count<Number;Count++)
-            {
-                if(Start_Div4<Range[Number].Start_Div4)
-                {
-                    break;
-                }
-            }
-
-            /* Check possible adjacent ranges for possible mergers */
-            if((Count>0U)&&
-               (Range[Count-1U].End_Div4==Start_Div4)&&
-               (RME_RV64V_PGT_MERGE(Range[Count-1U].Flag)==RME_RV64V_PGT_MERGE(Flag)))
-            {
-                Left=1U;
-            }
-            else if((Count<Number)&&
-                    (Range[Count].Start_Div4==End_Div4)&&
-                    (RME_RV64V_PGT_MERGE(Range[Count].Flag)==RME_RV64V_PGT_MERGE(Flag)))
-            {
-                Right=1U;
-            }
-        }
-    }
-    /* If there are no existing ranges, Don't bother */
-    else
-    {
-        Count=0U;
-    }
-
-    /* Merge with both sides */
-    if((Left!=0U)&&(Right!=0U))
-    {
-        /* Concatenate all ranges */
-        Range[Count-1U].End_Div4=Range[Count].End_Div4;
-        /* Should we use NAPOT or TOR? */
-        RME_RV64V_PGT_MODE(Range[Count-1U]);
-        /* Use aggregated flags from both sides */
-        Range[Count-1U].Flag|=Flag|Range[Count].Flag;
-        /* Clear the region that follow, range # decreases */
-        ___RME_RV64V_PMP_Range_Del(Range,Number,Count);
-        Number_New=Number-1U;
-        Count--;
-    }
-    /* Merge with left side only */
-    else if(Left!=0U)
-    {
-        Range[Count-1U].End_Div4=End_Div4;
-        /* Should we use NAPOT or TOR? */
-        RME_RV64V_PGT_MODE(Range[Count-1U]);
-        /* Use aggregated flags from left */
-        Range[Count-1U].Flag|=Flag;
-        /* Range # doesn't change */
-        Number_New=Number;
-        Count--;
-    }
-    /* Merge with right side only, range # may increase */
-    else if(Right!=0U)
-    {
-        Range[Count].Start_Div4=Start_Div4;
-        /* Should we use NAPOT or TOR? */
-        RME_RV64V_PGT_MODE(Range[Count]);
-        /* Use aggregated flags from right */
-        Range[Count].Flag|=Flag;
-        /* Range # doesn't change */
-        Number_New=Number;
-    }
-    /* Consider adding a new entry, range # will increase */
-    else
-    {
-        /* Make room for the new entry, with NAPOT */
-        ___RME_RV64V_PMP_Range_Ins(Range,Number,Count);
-        Range[Count].Start_Div4=Start_Div4;
-        Range[Count].End_Div4=End_Div4;
-        Range[Count].Order_Div4=Order_Div4;
-        Range[Count].Flag=Flag;
-        /* Range # increases */
-        Number_New=Number+1U;
-    }
-
-    /* We've exceeded the PMP entry capacity, need to kick someone out */
-    if(___RME_RV64V_PMP_Range_Entry(Range,Number_New)>RME_RV64V_REGION_NUM)
-    {
-        Count=___RME_RV64V_PMP_Range_Kick(Range,Number_New,Count);
-        ___RME_RV64V_PMP_Range_Del(Range,Number_New,Count);
-        Number_New--;
-    }
-
-    return (rme_ret_t)Number_New;
-}
-/* End Function:___RME_RV64V_PMP_Add *****************************************/
-
-/* Function:___RME_RV64V_PMP_Encode *******************************************
-Description : Encode the entries back to PMP representation.
-Input       : struct __RME_RV64V_PMP_Data* Top_Data - The top-level page data.
-              struct __RME_RV64V_PMP_Range* Range - The memory ranges.
-              rme_ptr_t Number - The number of memory ranges.
-              rme_ptr_t Paddr - The physical address of the page to add.
-              rme_ptr_t Size_Order - The page size order.
-              rme_ptr_t Flag - The flags.
-Output      : struct __RME_RV64V_PMP_Data* Top_Data - The top-level page data.
-Return      : None.
-******************************************************************************/
-void ___RME_RV64V_PMP_Encode(struct __RME_RV64V_PMP_Data* Top_Data,
-                             struct __RME_RV64V_PMP_Range* Range,
-                             rme_ptr_t Number)
-{
-    rme_ptr_t Data_Cnt;
-    rme_ptr_t Range_Cnt;
-    rme_u8_t* Cfg;
-
-    Data_Cnt=0U;
-    Cfg=(rme_u8_t*)(Top_Data->Raw.Cfg);
-
-    /* The "nonexistent" entries always default to "enable but do not allow
-     * any access", for compatibility with some of the nonstandard PMP
-     * implementations. These implementations allow U-mode accesses by default
-     * so we have to sacrifice one region for them, and report one less region
-     * to the kernel config. All PMP implementations have a even number of
-     * entries, so the unused space in PMPCFG array can be used for this purpose. */
-    Top_Data->Raw.Cfg[RME_RV64V_PMPCFG_NUM-1U]=0x18181818U;
-
-    /* Decide best use of the entries */
-    for(Range_Cnt=0U;Range_Cnt<Number;Range_Cnt++)
-    {
-        /* Using TOR - using 2 entries */
-        if(Range[Range_Cnt].Order_Div4==0U)
-        {
-            Cfg[Data_Cnt]=0U;
-            Top_Data->Raw.Addr[Data_Cnt]=Range[Range_Cnt].Start_Div4;
-            Cfg[Data_Cnt+1U]=RME_RV64V_PGT_MERGE(Range[Range_Cnt].Flag)|RME_RV64V_PMP_TOR;
-            Top_Data->Raw.Addr[Data_Cnt+1U]=Range[Range_Cnt].End_Div4;
-            Data_Cnt+=2;
-        }
-        /* Using NAPOT - using 1 entry */
-        else
-        {
-            Cfg[Data_Cnt]=RME_RV64V_PGT_MERGE(Range[Range_Cnt].Flag)|RME_RV64V_PMP_NAPOT;
-            Top_Data->Raw.Addr[Data_Cnt]=Range[Range_Cnt].Start_Div4|RME_MASK_END(Range[Range_Cnt].Order_Div4-2U);
-            Data_Cnt++;
-        }
-    }
-
-    RME_ASSERT(Data_Cnt<=RME_RV64V_REGION_NUM);
-
-    /* Disable the rest of entries */
-    while(Data_Cnt<RME_RV64V_REGION_NUM)
-    {
-        Cfg[Data_Cnt]=0U;
-        Data_Cnt++;
-    }
-}
-/* End Function:___RME_RV64V_PMP_Encode **************************************/
-
-/* Function:___RME_RV64V_PMP_Update *******************************************
-Description : Update the top-level MPU metadata for this page.
-              This always does addition, and does not do removal of mappings;
-              For any removal, a full flush of PMP registers is required.
-Input       : struct __RME_RV64V_Pgt_Meta* Top_Meta - The top-level page table.
-              rme_ptr_t Paddr - The address of the page.
-              rme_ptr_t Size_Order - The size order of the page.
-              rme_ptr_t Flag - The flag of the page.
-Output      : struct __RME_RV64V_Pgt_Meta* Top_Meta - The top-level page table.
-Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
-******************************************************************************/
-rme_ret_t ___RME_RV64V_PMP_Update(struct __RME_RV64V_Pgt_Meta* Top_Meta,
-                                  rme_ptr_t Paddr,
-                                  rme_ptr_t Size_Order,
-                                  rme_ptr_t Flag)
-{
-    rme_ret_t Number;
-    struct __RME_RV64V_PMP_Data* Top_Data;
-    struct __RME_RV64V_PMP_Range Range[RME_RV64V_REGION_NUM+1U];
-
-    Top_Data=(struct __RME_RV64V_PMP_Data*)(Top_Meta+1U);
-
-    /* Decode the PMP stuff into start/end */
-    Number=___RME_RV64V_PMP_Decode(Top_Data,Range);
-
-    /* Try to add the page into these ranges */
-    Number=___RME_RV64V_PMP_Add(Range,Number,Paddr,Size_Order,Flag);
-    if(Number<0)
-        return RME_ERR_HAL_FAIL;
-
-    /* Encode things back, kicking out */
-    ___RME_RV64V_PMP_Encode(Top_Data,Range,Number);
 
     return 0;
 }
-/* End Function:___RME_RV64V_PMP_Update **************************************/
+/* End Function:__RME_Pgt_Del_Check ****************************************/
 
-/* Function:__RME_Pgt_Page_Map ************************************************
-Description : Map a page into the page table.
+/* Function:__RME_Pgt_Page_Map **********************************************
+Description : Map a page into the page table. This architecture requires that the mapping is
+              always at least readable.
 Input       : struct RME_Cap_Pgt* - The cap ability to the page table to operate on.
-              rme_ptr_t Paddr - The physical address to map to.
+              rme_ptr_t Paddr - The physical address to map to. If we are unmapping, this have no effect.
               rme_ptr_t Pos - The position in the page table.
-              rme_ptr_t Flag - The RME standard page attributes. Need to
-                               translate them into architecture specific ones.
+              rme_ptr_t Flags - The RME standard page attributes. Need to translate them into
+                                architecture specific page table's settings.
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Page_Map(struct RME_Cap_Pgt* Pgt_Op,
-                             rme_ptr_t Paddr,
-                             rme_ptr_t Pos,
-                             rme_ptr_t Flag)
+rme_ret_t __RME_Pgt_Page_Map(struct RME_Cap_Pgt* Pgt_Op, rme_ptr_t Paddr, rme_ptr_t Pos, rme_ptr_t Flags)
 {
-    rme_u8_t* Flagtbl;
     rme_ptr_t* Table;
-    struct __RME_RV64V_Pgt_Meta* Meta;
+    rme_ptr_t RV64V_Flags;
+    rme_ptr_t Szord;
 
-    /* It should at least have some access permission */
-    if((Flag&(RME_PGT_READ|RME_PGT_WRITE|RME_PGT_EXECUTE))==0U)
+    /* It should at least be readable (Sv39 also requires R=1 whenever W=1) */
+    if((Flags&RME_PGT_READ)==0)
         return RME_ERR_HAL_FAIL;
 
-    /* Get the metadata */
-    Meta=RME_CAP_GETOBJ(Pgt_Op,struct __RME_RV64V_Pgt_Meta*);
-
-    /* Where is the entry slot */
-    if(((Pgt_Op->Base)&RME_PGT_TOP)!=0U)
-        Table=RME_RV64V_PGT_TBL_TOP(Meta);
-    else
-        Table=RME_RV64V_PGT_TBL_NOM(Meta);
-
-    /* Check if we are trying to make duplicate mappings into the same location */
-    if((Table[Pos]&RME_RV64V_PGT_PRESENT)!=0U)
+    /* Are we trying to map into the kernel space on the top level? */
+    if(((Pgt_Op->Base&RME_PGT_TOP)!=0)&&(Pos>=256))
         return RME_ERR_HAL_FAIL;
 
-    /* Register into the page table - PMP updated by page faults */
-    Table[Pos]=RME_RV64V_PGT_PRESENT|RME_RV64V_PGT_TERMINAL|
-               RME_ROUND_DOWN(Paddr,RME_PGT_SZORD(Pgt_Op->Order));
-    Flagtbl=(rme_u8_t*)&Table[RME_POW2(RME_PGT_NMORD(Pgt_Op->Order))];
-    Flagtbl[Pos]=Flag;
+    /* The position must fit in this table and the address must be aligned to
+     * the page size this table manages */
+    Szord=RME_PGT_SZORD(Pgt_Op->Order);
+    if((Pos>=RME_POW2(RME_PGT_NMORD(Pgt_Op->Order)))||
+       ((Paddr&RME_MASK_END(Szord-1U))!=0U))
+        return RME_ERR_HAL_FAIL;
+
+    /* Get the table */
+    Table=RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*);
+
+    /* A Sv39 leaf has the same encoding at every level - the level is implied
+     * by Size_Order, not by a PTE bit. The kernel half is refused above and is
+     * pre-built from the template, so anything mapped here is a user page. */
+    RV64V_Flags=RME_RV64V_MMU_PPN(Paddr)|RME_RV64V_PGFLG_RME2NAT(Flags)|RME_RV64V_MMU_U;
+
+    /* Try to map it in */
+    if(RME_COMP_SWAP(&(Table[Pos]),0,RV64V_Flags)==0)
+        return RME_ERR_HAL_FAIL;
 
     return 0;
 }
-/* End Function:__RME_Pgt_Page_Map *******************************************/
+/* End Function:__RME_Pgt_Page_Map *****************************************/
 
-/* Function:__RME_Pgt_Page_Unmap **********************************************
+/* Function:__RME_Pgt_Page_Unmap ********************************************
 Description : Unmap a page from the page table.
 Input       : struct RME_Cap_Pgt* - The capability to the page table to operate on.
               rme_ptr_t Pos - The position in the page table.
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Page_Unmap(struct RME_Cap_Pgt* Pgt_Op,
-                               rme_ptr_t Pos)
+rme_ret_t __RME_Pgt_Page_Unmap(struct RME_Cap_Pgt* Pgt_Op, rme_ptr_t Pos)
 {
     rme_ptr_t* Table;
-    struct __RME_RV64V_Pgt_Meta* Meta;
+    rme_ptr_t Temp;
 
-    /* Get the metadata */
-    Meta=RME_CAP_GETOBJ(Pgt_Op,struct __RME_RV64V_Pgt_Meta*);
-
-    /* Where is the entry slot */
-    if(((Pgt_Op->Base)&RME_PGT_TOP)!=0U)
-        Table=RME_RV64V_PGT_TBL_TOP(Meta);
-    else
-        Table=RME_RV64V_PGT_TBL_NOM(Meta);
-
-    /* Check if we are trying to remove something that does not exist, or trying to
-     * remove a page directory */
-    if(((Table[Pos]&RME_RV64V_PGT_PRESENT)==0)||
-       ((Table[Pos]&RME_RV64V_PGT_TERMINAL)==0U))
+    /* Are we trying to unmap the kernel space on the top level? */
+    if(((Pgt_Op->Base&RME_PGT_TOP)!=0)&&(Pos>=256))
         return RME_ERR_HAL_FAIL;
 
-    /* We don't update the PMP: if mapping removal is needed, do a manual flush */
-    Table[Pos]=0U;
+    if(Pos>=RME_POW2(RME_PGT_NMORD(Pgt_Op->Order)))
+        return RME_ERR_HAL_FAIL;
+
+    /* Get the table */
+    Table=RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*);
+
+    /* Make sure that there is something */
+    Temp=Table[Pos];
+    if(Temp==0)
+        return RME_ERR_HAL_FAIL;
+
+    /* At the 4KB level every valid entry is a leaf. At the 1GB/2MB levels an
+     * entry without R/W/X is a pointer to the next level table, which must not
+     * be removed through the page interface. */
+    if((RME_PGT_SZORD(Pgt_Op->Order)!=RME_PGT_SIZE_4K)&&((Temp&RME_RV64V_MMU_LEAF)==0))
+        return RME_ERR_HAL_FAIL;
+
+    /* Try to unmap it. Use CAS just in case */
+    if(RME_COMP_SWAP(&(Table[Pos]),Temp,0)==0)
+        return RME_ERR_HAL_FAIL;
 
     return 0;
 }
-/* End Function:__RME_Pgt_Page_Unmap *****************************************/
+/* End Function:__RME_Pgt_Page_Unmap ***************************************/
 
-/* Function:__RME_Pgt_Pgdir_Map ***********************************************
-Description : Map a page directory into the page table. This architecture does not
-              support page directory flags.
+/* Function:__RME_Pgt_Pgdir_Map *********************************************
+Description : Map a page directory into the page table.
 Input       : struct RME_Cap_Pgt* Pgt_Parent - The parent page table.
               struct RME_Cap_Pgt* Pgt_Child - The child page table.
               rme_ptr_t Pos - The position in the destination page table.
-              rme_ptr_t Flag - This have no effect for MPU-based architectures
-                               (because page table addresses use up the whole word).
+              rme_ptr_t Flags - The RME standard flags for the child page table.
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Pgdir_Map(struct RME_Cap_Pgt* Pgt_Parent,
-                              rme_ptr_t Pos,
-                              struct RME_Cap_Pgt* Pgt_Child,
-                              rme_ptr_t Flag)
+rme_ret_t __RME_Pgt_Pgdir_Map(struct RME_Cap_Pgt* Pgt_Parent, rme_ptr_t Pos,
+                                struct RME_Cap_Pgt* Pgt_Child, rme_ptr_t Flags)
 {
-    rme_u8_t* Flagtbl;
-    rme_ptr_t* Table;
-    struct __RME_RV64V_Pgt_Meta* Parent_Meta;
-    struct __RME_RV64V_Pgt_Meta* Child_Meta;
+    rme_ptr_t* Parent_Table;
+    rme_ptr_t* Child_Table;
+    rme_ptr_t RV64V_Flags;
 
-    /* Get the metadata */
-    Parent_Meta=RME_CAP_GETOBJ(Pgt_Parent,struct __RME_RV64V_Pgt_Meta*);
-    Child_Meta=RME_CAP_GETOBJ(Pgt_Child,struct __RME_RV64V_Pgt_Meta*);
-
-    /* The child must not be a top-level */
-    if(((Child_Meta->Base)&RME_PGT_TOP)!=0U)
+    /* It should at least be readable */
+    if((Flags&RME_PGT_READ)==0)
         return RME_ERR_HAL_FAIL;
 
-    /* Where is the entry slot? */
-    if(((Parent_Meta->Base)&RME_PGT_TOP)!=0U)
-        Table=RME_RV64V_PGT_TBL_TOP(Parent_Meta);
-    else
-        Table=RME_RV64V_PGT_TBL_NOM(Parent_Meta);
-
-    /* Check if anything already mapped in */
-    if((Table[Pos]&RME_RV64V_PGT_PRESENT)!=0U)
+    /* Are we trying to map into the kernel space on the top level? */
+    if(((Pgt_Parent->Base&RME_PGT_TOP)!=0)&&(Pos>=256))
         return RME_ERR_HAL_FAIL;
 
-    /* Register into the page table - PMP updated by page faults */
-    Table[Pos]=RME_RV64V_PGT_PRESENT|RME_RV64V_PGT_PGD_ADDR((rme_ptr_t)Child_Meta);
-    Flagtbl=(rme_u8_t*)&Table[RME_POW2(RME_PGT_NMORD(Pgt_Parent->Order))];
-    Flagtbl[Pos]=Flag;
+    if(Pos>=RME_POW2(RME_PGT_NMORD(Pgt_Parent->Order)))
+        return RME_ERR_HAL_FAIL;
+
+    /* Get the table */
+    Parent_Table=RME_CAP_GETOBJ(Pgt_Parent,rme_ptr_t*);
+    Child_Table=RME_CAP_GETOBJ(Pgt_Child,rme_ptr_t*);
+
+    /* A Sv39 non-leaf entry carries V plus the PPN of the child table and MUST
+     * NOT carry R/W/X (nor U - non-leaf U is reserved and must be zero),
+     * otherwise hardware decodes it as a huge page leaf. The RME flags are
+     * applied to the individual leaf pages instead. */
+    RV64V_Flags=RME_RV64V_MMU_V|RME_RV64V_MMU_PPN(RME_RV64V_VA2PA(Child_Table));
+
+    /* Try to map it in - may need to increase some count */
+    if(RME_COMP_SWAP(&(Parent_Table[Pos]),0,RV64V_Flags)==0)
+        return RME_ERR_HAL_FAIL;
 
     return 0;
 }
-/* End Function:__RME_Pgt_Pgdir_Map ******************************************/
+/* End Function:__RME_Pgt_Pgdir_Map ****************************************/
 
-/* Function:__RME_Pgt_Pgdir_Unmap *********************************************
+/* Function:__RME_Pgt_Pgdir_Unmap *******************************************
 Description : Unmap a page directory from the page table.
 Input       : struct RME_Cap_Pgt* Pgt_Parent - The parent page table to unmap from.
               rme_ptr_t Pos - The position in the page table.
@@ -2472,87 +1916,92 @@ Input       : struct RME_Cap_Pgt* Pgt_Parent - The parent page table to unmap fr
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Pgdir_Unmap(struct RME_Cap_Pgt* Pgt_Parent,
-                                rme_ptr_t Pos,
-                                struct RME_Cap_Pgt* Pgt_Child)
+rme_ret_t __RME_Pgt_Pgdir_Unmap(struct RME_Cap_Pgt* Pgt_Parent, rme_ptr_t Pos,
+                                  struct RME_Cap_Pgt* Pgt_Child)
 {
-    rme_ptr_t* Table;
-    struct __RME_RV64V_Pgt_Meta* Parent_Meta;
-    struct __RME_RV64V_Pgt_Meta* Child_Meta;
+    rme_ptr_t* Parent_Table;
+    rme_ptr_t Temp;
 
-    /* Get the metadata */
-    Parent_Meta=RME_CAP_GETOBJ(Pgt_Parent,struct __RME_RV64V_Pgt_Meta*);
-
-    /* Where is the entry slot */
-    if(((Pgt_Parent->Base)&RME_PGT_TOP)!=0U)
-        Table=RME_RV64V_PGT_TBL_TOP(Parent_Meta);
-    else
-        Table=RME_RV64V_PGT_TBL_NOM(Parent_Meta);
-
-    /* Check if we try to remove something nonexistent, or a page */
-    if(((Table[Pos]&RME_RV64V_PGT_PRESENT)==0U)||
-       ((Table[Pos]&RME_RV64V_PGT_TERMINAL)!=0U))
+    /* Are we trying to unmap the kernel space on the top level? */
+    if(((Pgt_Parent->Base&RME_PGT_TOP)!=0)&&(Pos>=256))
         return RME_ERR_HAL_FAIL;
 
-    /* See if the child page table is actually mapped there */
-    Child_Meta=(struct __RME_RV64V_Pgt_Meta*)RME_RV64V_PGT_PGD_ADDR(Table[Pos]);
-    if(Child_Meta!=RME_CAP_GETOBJ(Pgt_Child,struct __RME_RV64V_Pgt_Meta*))
+    if(Pos>=RME_POW2(RME_PGT_NMORD(Pgt_Parent->Order)))
         return RME_ERR_HAL_FAIL;
 
-    /* We don't update the PMP: if mapping removal is needed, do a manual flush */
-    Table[Pos]=0U;
+    /* Get the table */
+    Parent_Table=RME_CAP_GETOBJ(Pgt_Parent,rme_ptr_t*);
+
+    /* Make sure that there is something */
+    Temp=Parent_Table[Pos];
+    if(Temp==0)
+        return RME_ERR_HAL_FAIL;
+
+    /* The 4KB level cannot hold child tables, and a 1GB/2MB entry with R/W/X
+     * set is a leaf page, not a child table pointer. */
+    if((RME_PGT_SZORD(Pgt_Parent->Order)==RME_PGT_SIZE_4K)||((Temp&RME_RV64V_MMU_LEAF)!=0))
+        return RME_ERR_HAL_FAIL;
+
+    /* Is this child table the one mapped here? */
+    if(RME_RV64V_MMU_ADDR(Temp)!=RME_RV64V_VA2PA(RME_CAP_GETOBJ(Pgt_Child,rme_ptr_t*)))
+        return RME_ERR_HAL_FAIL;
+
+    /* Try to unmap it. Use CAS just in case */
+    if(RME_COMP_SWAP(&(Parent_Table[Pos]),Temp,0)==0)
+        return RME_ERR_HAL_FAIL;
 
     return 0;
 }
-/* End Function:__RME_Pgt_Pgdir_Unmap ****************************************/
+/* End Function:__RME_Pgt_Pgdir_Unmap **************************************/
 
 /* Function:__RME_Pgt_Lookup **************************************************
 Description : Lookup a page entry in a page directory.
 Input       : struct RME_Cap_Pgt* Pgt_Op - The page directory to lookup.
               rme_ptr_t Pos - The position to look up.
 Output      : rme_ptr_t* Paddr - The physical address of the page.
-              rme_ptr_t* Flag - The RME standard flags of the page.
+              rme_ptr_t* Flags - The RME standard flags of the page.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Lookup(struct RME_Cap_Pgt* Pgt_Op,
-                           rme_ptr_t Pos,
-                           rme_ptr_t* Paddr,
-                           rme_ptr_t* Flag)
+rme_ret_t __RME_Pgt_Lookup(struct RME_Cap_Pgt* Pgt_Op, rme_ptr_t Pos, rme_ptr_t* Paddr, rme_ptr_t* Flags)
 {
-    rme_u8_t* Flagtbl;
     rme_ptr_t* Table;
+    rme_ptr_t Temp;
 
-    /* Check if this is the top-level page table. Get the table */
-    if(((Pgt_Op->Base)&RME_PGT_TOP)!=0U)
-        Table=RME_RV64V_PGT_TBL_TOP(RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*));
-    else
-        Table=RME_RV64V_PGT_TBL_NOM(RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*));
+    /* Check if the position is within the range of this page table */
+    if((Pos>>RME_PGT_NMORD(Pgt_Op->Order))!=0)
+        return RME_ERR_HAL_FAIL;
 
-    /* Start lookup */
-    if(((Table[Pos]&RME_RV64V_PGT_PRESENT)==0U)||
-       ((Table[Pos]&RME_RV64V_PGT_TERMINAL)==0U))
+    /* Get the table */
+    Table=RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*);
+    /* Get the position requested - atomic read */
+    Temp=Table[Pos];
+
+    /* The entry must be valid. At the 4KB level every valid entry is a leaf;
+     * at the 1GB/2MB levels it must carry R/W/X to be a huge page rather than
+     * a pointer to the next level table. */
+    if((Temp&RME_RV64V_MMU_V)==0)
+        return RME_ERR_HAL_FAIL;
+
+    if((RME_PGT_SZORD(Pgt_Op->Order)!=RME_PGT_SIZE_4K)&&((Temp&RME_RV64V_MMU_LEAF)==0))
         return RME_ERR_HAL_FAIL;
 
     /* This is a page. Return the physical address and flags */
-    if(Paddr!=RME_NULL)
-        *Paddr=RME_RV64V_PGT_PTE_ADDR(Table[Pos]);
+    if(Paddr!=0)
+        *Paddr=RME_RV64V_MMU_ADDR(Temp);
 
-    /* The flags follow the pages */
-    if(Flag!=RME_NULL)
-    {
-        Flagtbl=(rme_u8_t*)&Table[RME_POW2(RME_PGT_NMORD(Pgt_Op->Order))];
-        *Flag=Flagtbl[Pos];
-    }
+    if(Flags!=0)
+        *Flags=RME_RV64V_PGFLG_NAT2RME(Temp);
 
     return 0;
 }
-/* End Function:__RME_Pgt_Lookup *********************************************/
+/* End Function:__RME_Pgt_Lookup *******************************************/
 
-/* Function:__RME_Pgt_Walk ****************************************************
+/* Function:__RME_Pgt_Walk **************************************************
 Description : Walking function for the page table. This function just does page
               table lookups. The page table that is being walked must be the top-
               level page table. The output values are optional; only pass in pointers
               when you need that value.
+              Walking kernel page tables is prohibited.
 Input       : struct RME_Cap_Pgt* Pgt_Op - The page table to walk.
               rme_ptr_t Vaddr - The virtual address to look up.
 Output      : rme_ptr_t* Pgt - The pointer to the page table level.
@@ -2563,95 +2012,74 @@ Output      : rme_ptr_t* Pgt - The pointer to the page table level.
               rme_ptr_t* Flags - The RME standard flags of the page.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
-rme_ret_t __RME_Pgt_Walk(struct RME_Cap_Pgt* Pgt_Op,
-                         rme_ptr_t Vaddr,
-                         rme_ptr_t* Pgt,
-                         rme_ptr_t* Map_Vaddr,
-                         rme_ptr_t* Paddr,
-                         rme_ptr_t* Size_Order,
-                         rme_ptr_t* Num_Order,
-                         rme_ptr_t* Flag)
+rme_ret_t __RME_Pgt_Walk(struct RME_Cap_Pgt* Pgt_Op, rme_ptr_t Vaddr, rme_ptr_t* Pgt,
+                           rme_ptr_t* Map_Vaddr, rme_ptr_t* Paddr, rme_ptr_t* Size_Order, rme_ptr_t* Num_Order, rme_ptr_t* Flags)
 {
-    struct __RME_RV64V_Pgt_Meta* Meta;
     rme_ptr_t* Table;
-    rme_u8_t* Flagtbl;
     rme_ptr_t Pos;
-    rme_ptr_t Shift;
-    rme_ptr_t Num;
-    rme_u8_t Flag_Final;
+    rme_ptr_t Temp;
+    rme_ptr_t Size_Cnt;
 
-    /* This must the top-level page table */
-    RME_ASSERT(((Pgt_Op->Base)&RME_PGT_TOP)!=0U);
+    /* Check if this is the top-level page table */
+    if(((Pgt_Op->Base)&RME_PGT_TOP)==0)
+        return RME_ERR_HAL_FAIL;
 
-    /* Get the table and start lookup */
-    Meta=RME_CAP_GETOBJ(Pgt_Op,struct __RME_RV64V_Pgt_Meta*);
-    Table=RME_RV64V_PGT_TBL_TOP(Meta);
+    /* Sv39's low canonical region ends at 2^38; this port never uses the
+     * supervisor high half, so reject anything outside the low region. */
+    if(Vaddr>=0x4000000000ULL)
+        return RME_ERR_HAL_FAIL;
 
-    /* Do lookup recursively */
-    Flag_Final=RME_PGT_ALL_PERM;
+    /* Get the table and start lookup - the root entry covers 1GB */
+    Table=RME_CAP_GETOBJ(Pgt_Op, rme_ptr_t*);
+
+    /* Calculate where is the entry - always 0 to 512 */
+    Pos=(Vaddr>>Size_Cnt)&0x1FF;
+    /* Atomic read */
+    Temp=Table[Pos];
+
+    Size_Cnt=RME_PGT_SIZE_1G;
     while(1)
     {
-        /* Check if the virtual address is in our range */
-        if(Vaddr<RME_PGT_BASE(Meta->Base))
+        /* Is the entry valid at all? */
+        if((Temp&RME_RV64V_MMU_V)==0)
             return RME_ERR_HAL_FAIL;
-        /* Calculate entry position - shifting by RME_WORD_BIT or more is UB */
-        Shift=RME_PGT_SZORD(Meta->Order);
-        if(Shift>=RME_WORD_BIT)
-            Pos=0U;
-        else
-            Pos=(Vaddr-RME_PGT_BASE(Meta->Base))>>Shift;
-        /* See if the entry is overrange */
-        Num=RME_POW2(RME_PGT_NMORD(Meta->Order));
-        if(Pos>=Num)
-            return RME_ERR_HAL_FAIL;
-        /* See if the entry exists */
-        if((Table[Pos]&RME_RV64V_PGT_PRESENT)==0U)
-            return RME_ERR_HAL_FAIL;
-        /* Find the position of the entry - Is there a page, a directory, or nothing? */
-        Flagtbl=(rme_u8_t*)(&Table[Num]);
-        if((Table[Pos]&RME_RV64V_PGT_TERMINAL)!=0U)
+
+        if((Temp&RME_RV64V_MMU_LEAF)!=0)
         {
-            /* This is a page - we found it */
-            if(Pgt!=RME_NULL)
-                *Pgt=(rme_ptr_t)Meta;
-            if(Map_Vaddr!=RME_NULL)
-            {
-                if(Shift>=RME_WORD_BIT)
-                    *Map_Vaddr=RME_PGT_BASE(Meta->Base);
-                else
-                    *Map_Vaddr=RME_PGT_BASE(Meta->Base)+(Pos<<Shift);
-            }
-            if(Paddr!=RME_NULL)
-            {
-                if(Shift>=RME_WORD_BIT)
-                    *Paddr=RME_PGT_BASE(Meta->Base);
-                else
-                    *Paddr=RME_PGT_BASE(Meta->Base)+(Pos<<Shift);
-            }
-            if(Size_Order!=RME_NULL)
-                *Size_Order=RME_PGT_SZORD(Meta->Order);
-            if(Num_Order!=RME_NULL)
-                *Num_Order=RME_PGT_NMORD(Meta->Order);
-            if(Flag!=RME_NULL)
-                *Flag=Flag_Final&Flagtbl[Pos];
+            /* This is a page/huge page - we found it. Sv39 keeps the
+             * permissions only in the leaf entry, there is nothing to
+             * accumulate from the upper levels. */
+            if(Pgt!=0)
+                *Pgt=(rme_ptr_t)Table;
+            if(Map_Vaddr!=0)
+                *Map_Vaddr=RME_ROUND_DOWN(Vaddr,Size_Cnt);
+            if(Paddr!=0)
+                *Paddr=RME_RV64V_MMU_ADDR(Temp);
+            if(Size_Order!=0)
+                *Size_Order=Size_Cnt;
+            if(Num_Order!=0)
+                *Num_Order=RME_PGT_NUM_512;
+            if(Flags!=0)
+                *Flags=RME_RV64V_PGFLG_NAT2RME(Temp);
 
             break;
         }
-        else
-        {
-            /* Accumulate flags on the way, if needed */
-            if(Flag!=RME_NULL)
-                Flag_Final&=Flagtbl[Pos];
-            /* This is a directory, we goto that directory to continue walking */
-            Meta=(struct __RME_RV64V_Pgt_Meta*)RME_RV64V_PGT_PGD_ADDR(Table[Pos]);
-            Table=RME_RV64V_PGT_TBL_NOM(Meta);
-        }
+
+        /* At the last level a non-leaf entry is malformed - fail rather than
+         * reporting an unmapped page as present. */
+        if(Size_Cnt==RME_PGT_SIZE_4K)
+            return RME_ERR_HAL_FAIL;
+
+        /* This is a directory, go to the child table to continue walking */
+        Table=(rme_ptr_t*)RME_RV64V_PA2VA(RME_RV64V_MMU_ADDR(Temp));
+
+        /* Each level down covers 512x less address space (1GB -> 2MB -> 4KB) */
+        Size_Cnt-=RME_PGT_SIZE_512B;
     }
 
     return 0;
 }
-#endif
-/* End Function:__RME_Pgt_Walk ***********************************************/
+/* End Function:__RME_Pgt_Walk *********************************************/
 
 /* End Of File ***************************************************************/
 
