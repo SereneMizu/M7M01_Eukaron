@@ -583,13 +583,6 @@ struct RME_Iret_Struct
     rme_ptr_t X2_SP;
 };
 
-/* Page Table ****************************************************************/
-/* The kernel half of a top-level table. Every top-level page table must carry
- * these entries so that a change of satp keeps the kernel mapped. */
-struct __RME_RV64V_Kern_Pgt
-{
-    rme_ptr_t Root[RME_POW2(RME_PGT_NUM_512)];
-};
 /*****************************************************************************/
 /* __RME_PLATFORM_RV64V_STRUCT__ */
 #endif
@@ -682,8 +675,6 @@ __RME_EXTERN__ rme_ptr_t RME_RV64V_Timestamp;
 __RME_EXTERN__ struct RME_CPU_Local RME_RV64V_Local;
 /* RV64V use simple kernel object table */
 __RME_EXTERN__ rme_ptr_t RME_RV64V_Kot[RME_KOT_WORD_NUM];
-/* The kernel mapping template, copied into every top-level page table */
-__RME_EXTERN__ struct __RME_RV64V_Kern_Pgt RME_RV64V_Kpgt;
 /*****************************************************************************/
 
 /* End Public Variable *******************************************************/

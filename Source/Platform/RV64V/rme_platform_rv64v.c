@@ -1638,33 +1638,19 @@ void __RME_Thd_Cop_Swap(rme_ptr_t Attr_New,
 /* Sv39 maps the RME flags directly onto the PTE bits, so the X64-style lookup
  * tables are gone - see RME_RV64V_PGFLG_RME2NAT/NAT2RME in the header. */
 
-/* The kernel mapping template - filled by __RME_Pgt_Kom_Init and copied into
- * the upper half of every top-level page table by __RME_Pgt_Init. */
-struct __RME_RV64V_Kern_Pgt RME_RV64V_Kpgt;
 
 /* Function:__RME_Pgt_Kom_Init ************************************************
-Description : Initialize the kernel mapping template, so it can be copied into
-              every top-level page table. The kernel is mapped as one 1GB leaf
-              in the Sv39 high half, covering physical [0x80000000,0xC0000000)
-              where the image, the object memory and the stacks live.
+Description : Stub retained for the common kernel interface. The Sv39 kernel
+              mapping (one 1GB leaf in the high half covering physical
+              [0x80000000,0xC0000000)) is hardcoded directly in __RME_Pgt_Init,
+              so there is no template left to build here.
 Input       : None.
 Output      : None.
 Return      : rme_ret_t - If successful, 0; else RME_ERR_HAL_FAIL.
 ******************************************************************************/
 rme_ret_t __RME_Pgt_Kom_Init(void)
 {
-    rme_cnt_t Count;
-    rme_ptr_t Pos;
-
-    for(Count=0;Count<RME_POW2(RME_PGT_NUM_512);Count++)
-        RME_RV64V_Kpgt.Root[Count]=0;
-
-    /* Top-level index of the high-half address that maps physical 0x80000000 */
-    Pos=(RME_RV64V_PA2VA(0x80000000U)>>RME_PGT_SIZE_1G)&0x1FFU;
-    RME_RV64V_Kpgt.Root[Pos]=RME_RV64V_MMU_PPN(0x80000000U)|RME_RV64V_MMU_V|
-                             RME_RV64V_MMU_R|RME_RV64V_MMU_W|RME_RV64V_MMU_X;
-
-    return 0;
+     return 0;
 }
 /* End Function:__RME_Pgt_Kom_Init *******************************************/
 
@@ -1740,21 +1726,17 @@ rme_ret_t __RME_Pgt_Init(struct RME_Cap_Pgt* Pgt_Op)
     /* Get the actual table - the object memory IS the hardware table */
     Ptr=RME_CAP_GETOBJ(Pgt_Op,rme_ptr_t*);
 
-    /* Every Sv39 table has 512 entries. The low half belongs to the process
-     * and starts empty; a top-level table also carries the shared kernel
-     * mappings in its high half so a satp switch keeps the kernel mapped. */
-    for(Count=0;Count<256;Count++)
+    /* Every Sv39 table has 512 entries and starts empty. A top-level table
+     * also gets a single hardcoded kernel entry in the high half (below) so a
+     * satp switch keeps the kernel mapped. */
+    for(Count=0;Count<RME_POW2(RME_PGT_NUM_512);Count++)
         Ptr[Count]=0;
 
     if((Pgt_Op->Base&RME_PGT_TOP)!=0)
     {
-        for(;Count<RME_POW2(RME_PGT_NUM_512);Count++)
-            Ptr[Count]=RME_RV64V_Kpgt.Root[Count];
-    }
-    else
-    {
-        for(;Count<RME_POW2(RME_PGT_NUM_512);Count++)
-            Ptr[Count]=0;
+        /* Top-level index of the high-half address that maps physical 0x80000000 */
+        Ptr[258]=RME_RV64V_MMU_PPN(0x80000000U)|RME_RV64V_MMU_V|
+                 RME_RV64V_MMU_R|RME_RV64V_MMU_W|RME_RV64V_MMU_X;
     }
 
     return 0;
@@ -2032,14 +2014,14 @@ rme_ret_t __RME_Pgt_Walk(struct RME_Cap_Pgt* Pgt_Op, rme_ptr_t Vaddr, rme_ptr_t*
     /* Get the table and start lookup - the root entry covers 1GB */
     Table=RME_CAP_GETOBJ(Pgt_Op, rme_ptr_t*);
 
-    /* Calculate where is the entry - always 0 to 512 */
-    Pos=(Vaddr>>Size_Cnt)&0x1FF;
-    /* Atomic read */
-    Temp=Table[Pos];
-
     Size_Cnt=RME_PGT_SIZE_1G;
+
     while(1)
     {
+        /* Calculate where is the entry - always 0 to 512 */
+        Pos=(Vaddr>>Size_Cnt)&0x1FF;
+        /* Atomic read */
+        Temp=Table[Pos];
         /* Is the entry valid at all? */
         if((Temp&RME_RV64V_MMU_V)==0)
             return RME_ERR_HAL_FAIL;
