@@ -17,18 +17,18 @@ Description : The configuration file for the QEMU virt platform.
  * VA = 0xFFFFFFC000000000 + physical 0x81000000 (see RME_RV64V_VA_BASE) */
 #define RME_KOM_VA_BASE                                 (0xFFFFFFC081000000ULL)
 /* Kernel object virtual memory size */
-#define RME_KOM_VA_SIZE                                 (0xD000)
+#define RME_KOM_VA_SIZE                                 (0x1F000000U)
 /* Hypervisor context virtual memory base - set to 0 if no VM */
 #define RME_HYP_VA_BASE                                 (0x0U)
 /* Hypervisor context virtual memory size - set to 0 if no VM */
 #define RME_HYP_VA_SIZE                                 (0xFFFFFFFFU)
 /* Kernel memory allocation granularity order */
-#define RME_KOM_SLOT_ORDER                              (4U)
+#define RME_KOM_SLOT_ORDER                              (6U)
 /* Kernel stack size and address - high half as well */
 #define RME_KSTK_VA_BASE                                (0xFFFFFFC08100E000ULL)
 #define RME_KSTK_VA_SIZE                                (0x800U)
 /* The maximum number of preemption priorities */
-#define RME_PREEMPT_PRIO_NUM                            (32U)
+#define RME_PREEMPT_PRIO_NUM                            (64U)
 
 /* Physical vector number */
 #define RME_RVM_PHYS_VCT_NUM                            (104U)
